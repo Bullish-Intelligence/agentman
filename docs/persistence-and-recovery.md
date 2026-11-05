@@ -62,6 +62,11 @@ The product row is written through DBOS steps so recovery does not attempt a
 second plain insert for the same workflow id. A failure to record `failed` is
 logged without replacing the original turn exception.
 
+The DBOS model step stores captured stream events with DBOS serialization.
+Agentman JSON-round-trips those events before they cross the step boundary.
+This removes transient provider callbacks while preserving reasoning text and
+the completed model response.
+
 ## Semantic journal
 
 `step_persistence.*` mirrors the pydantic-ai harness `StepStore` contract:
