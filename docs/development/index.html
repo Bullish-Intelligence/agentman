@@ -1,0 +1,104 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content="light dark"><title>Development guide · agentman</title><link rel=stylesheet href=../../css/docs.css><script defer src=../../js/docs.js></script></head><body class=doc-site><a class=doc-skip href=#doc-main>Skip to content</a><header class=doc-header><a class=doc-project href=../../>agentman</a></header><div class=doc-layout><aside class=doc-sidebar aria-label="Project navigation"><details id=doc-menu class=doc-menu open><summary class=doc-menu-toggle>Menu</summary><div class=doc-menu-content><a class=doc-sidebar-title href=../../>agentman</a><nav aria-label=Documentation><ul class=doc-nav><li><a class=doc-nav-link href=../../>agentman</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/>agentman documentation</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/overview/>Overview</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/getting-started/>Getting started</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/reference/>CLI and configuration reference</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/architecture/>Architecture</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/persistence-and-recovery/>Persistence and recovery</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/development/ aria-current=page>Development guide</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/roadmap/>Roadmap and gaps</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/adr/0001-system-wide-ai-activity-record/>ADR 0001: Record AI activity across local agents</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/adr/0002-external-coding-agent-jobs/>ADR 0002: Launch and track external coding-agent jobs</a></li></ul></nav></div></details></aside><main id=doc-main class=doc-content><article><h1 id=development-guide>Development guide</h1><h2 id=repository-workflow>Repository workflow</h2><p>This is a Python repository with a devenv shell. Use the shell for all
+commands. Keep a change focused, run the checks, and review the result before
+you push.</p><p>Initial setup:</p><div class=highlight><pre tabindex=0 class=chroma><code class=language-sh data-lang=sh><span class=line><span class=cl>devenv shell
+</span></span><span class=line><span class=cl>uv sync --all-extras</span></span></code></pre></div><p>The repository&rsquo;s <code>AGENTS.md</code> is the canonical working agreement. It also
+defines the exit-code convention used by the application.</p><p><code>agentman version</code> reports the installed package version and socket protocol
+version. <code>GET /v1/health</code> reports the same pair so operators can compare the
+client and daemon before a request.</p><h2 id=repository-map>Repository map</h2><div class=highlight><pre tabindex=0 class=chroma><code class=language-text data-lang=text><span class=line><span class=cl>src/agentman/
+</span></span><span class=line><span class=cl>  cli.py                 public command surface and exit codes
+</span></span><span class=line><span class=cl>  client.py              Unix-socket client and SSE handling
+</span></span><span class=line><span class=cl>  config.py              flat configuration and provenance
+</span></span><span class=line><span class=cl>  discovery.py           workspace and config directory resolution
+</span></span><span class=line><span class=cl>  daemon.py              ASGI daemon, routes, DBOS lifecycle, socket serving
+</span></span><span class=line><span class=cl>  model.py               inferference and pydantic-ai model resolution
+</span></span><span class=line><span class=cl>  agent.py               AgentSpec → pydantic-ai Agent construction
+</span></span><span class=line><span class=cl>  runtime.py             DBOS workflow and history loading
+</span></span><span class=line><span class=cl>  protocol.py            versioned socket request/response models
+</span></span><span class=line><span class=cl>  schema.py              repository-interpreter schema/validation bridge
+</span></span><span class=line><span class=cl>  recovery.py            resume authorization policy
+</span></span><span class=line><span class=cl>  effects.py             file-effect pre/post hash evidence
+</span></span><span class=line><span class=cl>  status.py              product/journal status composition
+</span></span><span class=line><span class=cl>  render.py              on-demand Markdown view
+</span></span><span class=line><span class=cl>  persistence/
+</span></span><span class=line><span class=cl>    tables.py            SQLAlchemy metadata
+</span></span><span class=line><span class=cl>    store.py             agentman thread/run CRUD
+</span></span><span class=line><span class=cl>    step_store.py        harness StepStore Postgres adapter
+</span></span><span class=line><span class=cl>    inspect.py            journal inspection queries
+</span></span><span class=line><span class=cl>src/structured_agents/
+</span></span><span class=line><span class=cl>  spec.py                provider-neutral spec loader and extensions
+</span></span><span class=line><span class=cl>migrations/
+</span></span><span class=line><span class=cl>  versions/0001_initial.py  frozen product/journal schema
+</span></span><span class=line><span class=cl>tests/
+</span></span><span class=line><span class=cl>  test_*.py              unit, integration, crash, live-rig, and CLI tests
+</span></span><span class=line><span class=cl>docs/
+</span></span><span class=line><span class=cl>  *.md                   user-facing documentation</span></span></code></pre></div><h2 id=architectural-contracts>Architectural contracts</h2><p>Changes should preserve these contracts unless the design and docs change with
+them:</p><h3 id=one-canonical-run-id>One canonical run id</h3><p>The DBOS workflow id, pydantic-ai <code>run_id</code>, harness <code>run_id</code>, and
+<code>agentman.run.id</code> are the same value. Do not add a translation table.</p><h3 id=the-daemon-is-the-only-postgres-client>The daemon is the only Postgres client</h3><p>CLI reads and writes go through the socket. Keep SQLAlchemy, asyncpg, product
+store, journal, and DBOS wiring on the daemon side. Import-linter contains an
+explicit client boundary contract.</p><h3 id=the-client-owns-repository-python-types>The client owns repository Python types</h3><p>The daemon receives JSON Schema, not a Python class. Resolve and validate
+output types with the repository interpreter; do not import repository modules
+into the daemon.</p><h3 id=no-interactive-serialization>No interactive serialization</h3><p>Do not introduce a DBOS queue, process-wide lock, exclusive connection, or
+daemon-wide semaphore around <code>execute()</code>. Fan-out’s semaphore is deliberately
+local to one client invocation.</p><h3 id=record-before-convenience>Record before convenience</h3><p>The journal is authoritative for model messages, snapshots, events, and tool
+effects. Markdown rendering and SSE are views. A feature that introduces a
+second message or event representation needs a written justification.</p><h3 id=recovery-facts-not-replay-permission>Recovery facts, not replay permission</h3><p>Harness inspection supplies facts. agentman’s recovery module applies a small
+policy. Unknown side effects are surfaced and refused; they are not silently
+rerun.</p><h3 id=workspace-is-a-security-and-correctness-input>Workspace is a security and correctness input</h3><p>Workspace participates in thread identity, client state, tool roots, and agent
+cache shape. Any capability that can touch the filesystem must be keyed and
+scoped by the request workspace.</p><h2 id=verification>Verification</h2><p>The default suite is hermetic. Integration tests that need Postgres are gated
+by <code>AGENTMAN_RUN_INTEGRATION=1</code>; the live router suite additionally uses
+<code>AGENTMAN_RUN_LIVE_RIG=1</code>.</p><p>Run the checks from the repository root:</p><div class=highlight><pre tabindex=0 class=chroma><code class=language-sh data-lang=sh><span class=line><span class=cl>devenv shell -- ruff check src tests
+</span></span><span class=line><span class=cl>devenv shell -- ruff format --check src tests
+</span></span><span class=line><span class=cl>devenv shell -- ty check src
+</span></span><span class=line><span class=cl>devenv shell -- pytest</span></span></code></pre></div><p>The <code>devenv.nix</code> tasks expose the same checks, and import-linter enforces the
+package boundaries.</p><p>For the project Postgres cluster:</p><div class=highlight><pre tabindex=0 class=chroma><code class=language-sh data-lang=sh><span class=line><span class=cl>devenv up -d
+</span></span><span class=line><span class=cl>devenv shell -- env <span class=nv>AGENTMAN_RUN_INTEGRATION</span><span class=o>=</span><span class=m>1</span> <span class=se>\
+</span></span></span><span class=line><span class=cl>  <span class=nv>AGENTMAN_TEST_DATABASE_URL</span><span class=o>=</span>postgresql+asyncpg://&lt;role&gt;@127.0.0.1:&lt;port&gt;/&lt;fresh-test-database&gt; <span class=se>\
+</span></span></span><span class=line><span class=cl>  uv run pytest</span></span></code></pre></div><p>Integration mode requires an explicit <code>AGENTMAN_TEST_DATABASE_URL</code>; the
+fixture applies <code>alembic upgrade head</code> before the tests. Use a fresh or known
+test database. Do not rely on a familiar port or database name as proof of
+ownership.</p><p>Useful focused suites include:</p><table><thead><tr><th>Suite</th><th>Evidence</th></tr></thead><tbody><tr><td><code>test_cli.py</code>, <code>test_cli_integration.py</code></td><td>command behavior and exit codes</td></tr><tr><td><code>test_runtime.py</code></td><td>workflow lifecycle, caching, canonical ids</td></tr><tr><td><code>test_daemon_integration.py</code></td><td>real daemon transport and concurrency overlap</td></tr><tr><td><code>test_step_store_integration.py</code>, <code>test_store_integration.py</code></td><td>Postgres product/journal behavior</td></tr><tr><td><code>test_crash_windows.py</code>, <code>test_recovery_integration.py</code></td><td>crash-window and resume policy</td></tr><tr><td><code>test_live_rig.py</code></td><td>live router capabilities, schema request, and model path</td></tr><tr><td><code>test_systemd.py</code></td><td>passed-fd serving behavior</td></tr></tbody></table><p>The default test run does not prove Postgres recovery or a live model path.
+Always name the gate when reporting evidence.
+The live-rig tests default to the <code>gemma</code> model. Set <code>AGENTMAN_LIVE_MODEL</code> to
+a resident model name when the configured router uses another model; the tests
+read that model&rsquo;s advertised parallel slot count.</p><h2 id=fresh-machine-acceptance>Fresh-machine acceptance</h2><p>This procedure applies to the intended machine installation, not to the
+hermetic project shell. It must be run against a machine where the current
+agentman package is installed, the systemd socket and service units are active,
+and machine Postgres has an <code>agentman</code> database and role. That installation is
+configured outside this repository.</p><p>Record the package version, source revision, toolchain revision, and the exact
+check commands before starting. Then verify:</p><p>Run <code>agentman version</code> to record the package and protocol versions. Record the
+installed toolchain manifest and the active system generation as well.</p><ol><li>On reboot, no agentman daemon process is running before the first request.</li><li>The socket unit exposes <code>%t/agentman.sock</code> with mode <code>0600</code>.</li><li>The first <code>agentman ls</code> activates the service and reaches the daemon.</li><li><code>agentman migrate</code> completes against machine Postgres without a
+repository-tracked credential.</li><li>A fresh clone can define a minimal repository agent and typed output model
+without installing agentman into the clone&rsquo;s dependency tree.</li><li>A typed <code>agentman send --json</code> succeeds from that clone, and
+<code>agentman status</code>, <code>agentman show</code>, and <code>agentman resume</code> inspect the
+same durable record. A terminal run cannot resume and returns HTTP 409.</li><li>A repository with <code>tools: coder</code> is rejected or accepted only according
+to the intended socket permission boundary; never broaden the socket mode
+for convenience.</li><li>The daemon is using the machine database and does not bind its own Unix
+socket when systemd has supplied the listening descriptor.</li></ol><p>Capture command output and service/database logs as acceptance evidence. A
+passing project test run is not a substitute for this check. Record the results
+in the release evidence record. If a reboot or privileged system change cannot
+run, record the exact blocker and leave the affected acceptance steps pending.</p><h2 id=release-procedure>Release procedure</h2><p>Create a release from a verified change on the main branch:</p><div class=highlight><pre tabindex=0 class=chroma><code class=language-sh data-lang=sh><span class=line><span class=cl>git switch -c release-x-y-z
+</span></span><span class=line><span class=cl><span class=c1># bump the version in pyproject.toml</span>
+</span></span><span class=line><span class=cl>git commit -m <span class=s2>&#34;chore: bump version to X.Y.Z&#34;</span>
+</span></span><span class=line><span class=cl><span class=c1># run the checks above</span>
+</span></span><span class=line><span class=cl>git switch main
+</span></span><span class=line><span class=cl>git merge --ff-only release-x-y-z
+</span></span><span class=line><span class=cl>git tag -a vX.Y.Z -m <span class=s2>&#34;vX.Y.Z&#34;</span>
+</span></span><span class=line><span class=cl>git push origin main --tags</span></span></code></pre></div><p>Before the release tag is created, the evidence record must name the
+hermetic check, a fresh or migrated Postgres integration check, live-router
+typed validation when applicable, crash-window recovery, fan-out ordering, and
+the fresh-machine and systemd acceptance result. The release note must state
+which checks ran and which remain unavailable; “tests pass” is not sufficient.</p><h2 id=database-changes>Database changes</h2><p>The current Alembic revision is intentionally frozen as an explicit schema
+description. When changing SQLAlchemy metadata:</p><ol><li>decide whether the data-model change is actually required;</li><li>update the migration explicitly rather than importing live metadata into an
+old revision;</li><li>add migration and integration tests;</li><li>verify metadata/migration drift checks; and</li><li>document compatibility and recovery implications.</li></ol><p>DBOS’s private schema is not an agentman migration target. Keep application
+tables, journal tables, and DBOS tables in their ownership domains.</p><h2 id=dependency-changes>Dependency changes</h2><p>The important compatibility pins are intentional:</p><ul><li><code>pydantic-ai-harness</code> is capped below the next minor because the run-id
+adapter depends on an internal <code>for_run</code> behavior;</li><li>DBOS is pinned to the stable 3.0 line; and</li><li>inferference is pinned to the release that provides the agentman capability
+contract.</li></ul><p>Read the relevant upstream behavior and record the reason before widening a
+range. A dependency bump that changes workflow or step storage requires the
+recovery acceptance suite, not just import success.</p><h2 id=documentation-maintenance>Documentation maintenance</h2><p>When changing a user-visible command, config key, protocol field, storage
+invariant, or operational assumption, update the matching document in the same
+change. In particular:</p><ul><li>command/config changes → <code>docs/reference.md</code> and <code>docs/getting-started.md</code>;</li><li>runtime or boundary changes → <code>docs/architecture.md</code>;</li><li>persistence/recovery changes → <code>docs/persistence-and-recovery.md</code>;</li><li>status or deployment changes → <code>docs/overview.md</code> and <code>docs/roadmap.md</code>;</li><li>repository workflow changes → this document and <code>AGENTS.md</code> if the project
+law changed.</li></ul><p>The docs should link to source concepts and tests by stable path, but should
+avoid pretending a design note, a unit test, and a deployed service are the
+same kind of evidence.</p></article><nav class=doc-pagination aria-label="Page navigation"><a class=doc-previous href=../../docs/persistence-and-recovery/><span>Previous</span><strong>Persistence and recovery</strong>
+</a><a class=doc-next href=../../docs/roadmap/><span>Next</span><strong>Roadmap and gaps</strong></a></nav></main><aside class=doc-toc aria-label="On this page"><h2>On this page</h2><nav id=TableOfContents><ul><li><a href=#repository-workflow>Repository workflow</a></li><li><a href=#repository-map>Repository map</a></li><li><a href=#architectural-contracts>Architectural contracts</a><ul><li><a href=#one-canonical-run-id>One canonical run id</a></li><li><a href=#the-daemon-is-the-only-postgres-client>The daemon is the only Postgres client</a></li><li><a href=#the-client-owns-repository-python-types>The client owns repository Python types</a></li><li><a href=#no-interactive-serialization>No interactive serialization</a></li><li><a href=#record-before-convenience>Record before convenience</a></li><li><a href=#recovery-facts-not-replay-permission>Recovery facts, not replay permission</a></li><li><a href=#workspace-is-a-security-and-correctness-input>Workspace is a security and correctness input</a></li></ul></li><li><a href=#verification>Verification</a></li><li><a href=#fresh-machine-acceptance>Fresh-machine acceptance</a></li><li><a href=#release-procedure>Release procedure</a></li><li><a href=#database-changes>Database changes</a></li><li><a href=#dependency-changes>Dependency changes</a></li><li><a href=#documentation-maintenance>Documentation maintenance</a></li></ul></nav></aside></div><footer class=doc-footer></footer></body></html>

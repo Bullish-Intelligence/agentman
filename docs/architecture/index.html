@@ -1,0 +1,91 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content="light dark"><title>Architecture · agentman</title><link rel=stylesheet href=../../css/docs.css><script defer src=../../js/docs.js></script></head><body class=doc-site><a class=doc-skip href=#doc-main>Skip to content</a><header class=doc-header><a class=doc-project href=../../>agentman</a></header><div class=doc-layout><aside class=doc-sidebar aria-label="Project navigation"><details id=doc-menu class=doc-menu open><summary class=doc-menu-toggle>Menu</summary><div class=doc-menu-content><a class=doc-sidebar-title href=../../>agentman</a><nav aria-label=Documentation><ul class=doc-nav><li><a class=doc-nav-link href=../../>agentman</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/>agentman documentation</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/overview/>Overview</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/getting-started/>Getting started</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/reference/>CLI and configuration reference</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/architecture/ aria-current=page>Architecture</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/persistence-and-recovery/>Persistence and recovery</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/development/>Development guide</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/roadmap/>Roadmap and gaps</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/adr/0001-system-wide-ai-activity-record/>ADR 0001: Record AI activity across local agents</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../docs/adr/0002-external-coding-agent-jobs/>ADR 0002: Launch and track external coding-agent jobs</a></li></ul></nav></div></details></aside><main id=doc-main class=doc-content><article><h1 id=architecture>Architecture</h1><h2 id=design-rule>Design rule</h2><p>Before adding an agentman abstraction, check whether pydantic-ai, pydantic-ai
+harness, or DBOS already owns that problem. The current code gives agentman
+three product responsibilities:</p><ol><li>resolve the workspace and thread;</li><li>identify the agent and model for a turn; and</li><li>store and expose the record.</li></ol><p>The surrounding libraries retain ownership of agent semantics, model provider
+integration, durable execution, and the semantic step journal.</p><h2 id=system-shape>System shape</h2><div class=highlight><pre tabindex=0 class=chroma><code class=language-text data-lang=text><span class=line><span class=cl>repository shell
+</span></span><span class=line><span class=cl>  └─ agentman CLI
+</span></span><span class=line><span class=cl>       ├─ resolves workspace, config, spec, Python output type
+</span></span><span class=line><span class=cl>       ├─ sends JSON + JSON Schema over HTTP on a Unix socket
+</span></span><span class=line><span class=cl>       └─ validates returned JSON in the repository interpreter
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>Unix socket
+</span></span><span class=line><span class=cl>  └─ agentman daemon (ASGI/uvicorn)
+</span></span><span class=line><span class=cl>       ├─ owns the only Postgres connection path
+</span></span><span class=line><span class=cl>       ├─ resolves model capabilities and router endpoint
+</span></span><span class=line><span class=cl>       ├─ starts one DBOS workflow per turn
+</span></span><span class=line><span class=cl>       ├─ streams AgentStreamEvent values as SSE
+</span></span><span class=line><span class=cl>       └─ serves thread/run/status/resume queries
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>DBOS workflow
+</span></span><span class=line><span class=cl>  └─ pydantic-ai Agent
+</span></span><span class=line><span class=cl>       ├─ StepPersistence → step_persistence.* journal
+</span></span><span class=line><span class=cl>       ├─ optional Coder → workspace tools
+</span></span><span class=line><span class=cl>       ├─ DBOSDurability → DBOS-owned workflow state
+</span></span><span class=line><span class=cl>       └─ model call → inferference or another pydantic-ai provider
+</span></span><span class=line><span class=cl>
+</span></span><span class=line><span class=cl>Postgres
+</span></span><span class=line><span class=cl>  ├─ DBOS-owned tables
+</span></span><span class=line><span class=cl>  ├─ step_persistence.*
+</span></span><span class=line><span class=cl>  └─ agentman.*</span></span></code></pre></div><h2 id=client-and-daemon-boundary>Client and daemon boundary</h2><p>The client resolves repository-local concerns because one system daemon must be
+usable from many repositories and virtual environments. A <code>TurnRequest</code>
+contains:</p><ul><li>the resolved workspace path;</li><li>the thread id;</li><li>the serialized pydantic-ai agent spec;</li><li>the optional <code>coder</code> tool declaration;</li><li>the optional provider transport retry limit;</li><li>the agent and model labels;</li><li>the prompt; and</li><li>the output JSON Schema and output type label.</li></ul><p>The daemon does not read its own current working directory, the caller’s
+repository config, or repository Python modules. It receives data over the
+socket and can therefore remain independent of the repository’s dependency
+tree.</p><p>The daemon is the only Postgres client. Even <code>ls</code>, <code>show</code>, and <code>status</code> are
+socket requests. This keeps the database URL and SQLAlchemy/asyncpg boundary
+out of client-side repository environments.</p><h2 id=typed-output-flow>Typed output flow</h2><ol><li>An agent spec may declare <code>output: module:Attribute</code>.</li><li>The CLI resolves that reference against the spec directory using the
+repository interpreter.</li><li>That interpreter emits JSON Schema through <code>_schema_runner.py</code>.</li><li>The client sends the schema to the daemon.</li><li>The daemon builds a pydantic-ai <code>StructuredDict</code>; it does not import the
+Python model.</li><li>For <code>inferference:&lt;name></code>, the daemon checks router capabilities, resolves
+aliases to a resident model, and requires <code>SCHEMA</code> only when the request is
+typed.</li><li>The daemon returns JSON in the final SSE envelope.</li><li>The client runs pydantic validation in the repository interpreter and prints
+the canonical JSON or reports a finding.</li></ol><p>For local inferference models, the model profile is merged over the provider
+default to advertise native JSON Schema output and the router’s context window.
+The schema sent to the OpenAI-compatible endpoint is flattened by the daemon’s
+<code>StructuredDict</code> path, so acceptance and final validation are the meaningful
+checks—not byte-for-byte equality with the source schema.</p><h2 id=model-resolution>Model resolution</h2><p>The model boundary has two related paths. The daemon&rsquo;s turn path:</p><ul><li>checks inferference capabilities for <code>inferference:&lt;name></code> requests, resolves
+aliases through the shared capability resolver, and obtains context metadata
+for the canonical resident model;</li><li>requires the router&rsquo;s <code>SCHEMA</code> constraint only when the client sends a typed
+output schema; default string turns do not require the constraint;</li><li>resolves the router lazily if it was not configured globally, so a
+repository-selected inferference model still works;</li><li>builds the model against the configured or resolved router endpoint; and</li><li>hands any other model string to pydantic-ai unchanged when no transport
+retry limit was requested.</li></ul><p>The local OpenAI-compatible route supports a per-run transport retry limit.
+The daemon rejects an explicit limit for other provider strings before it
+starts a workflow. Omission keeps the pinned OpenAI SDK default of two retries.
+The SDK allows at most <code>N + 1</code> physical attempts for each logical model
+request. Pydantic AI output and tool retries remain separate. Agentman does not
+switch providers or models after an error.</p><p>The client-side <code>model.py</code> resolver supplies fan-out&rsquo;s default concurrency
+from inferference&rsquo;s <code>ModelInfo.n_parallel</code>. Explicit <code>-j N</code> does not need a
+capabilities lookup. Unknown aliases or missing resident models fail before a
+workflow starts. agentman does not construct or own GPU schedulers;
+inferference owns the long-lived router process.</p><h2 id=workflow-and-concurrency>Workflow and concurrency</h2><p>The runtime exposes one workflow boundary:</p><div class=highlight><pre tabindex=0 class=chroma><code class=language-python data-lang=python><span class=line><span class=cl><span class=nd>@DBOS.workflow</span><span class=p>()</span>
+</span></span><span class=line><span class=cl><span class=k>async</span> <span class=k>def</span> <span class=nf>execute</span><span class=p>(</span><span class=n>turn</span><span class=p>:</span> <span class=n>Turn</span><span class=p>)</span> <span class=o>-&gt;</span> <span class=n>TurnResult</span><span class=p>:</span> <span class=o>...</span></span></span></code></pre></div><p>The workflow id is read as the run id and passed unchanged to:</p><div class=highlight><pre tabindex=0 class=chroma><code class=language-text data-lang=text><span class=line><span class=cl>agentman.run.id
+</span></span><span class=line><span class=cl>  = DBOS workflow id
+</span></span><span class=line><span class=cl>  = pydantic-ai run_id
+</span></span><span class=line><span class=cl>  = StepPersistence run_id</span></span></code></pre></div><p>The thread id is the pydantic-ai conversation id. This prevents a mapping
+table or fuzzy reconciliation between subsystems.</p><p>agentman intentionally does not register a DBOS queue on the interactive path,
+put a lock around <code>execute</code>, hold one exclusive connection for a turn, or add a
+shared runtime semaphore. Postgres transactions are short and per store
+method. Concurrent turns remain in flight so the model router can batch them
+when the router supports it.</p><p><code>pipe --each</code> adds only a per-invocation client semaphore. It limits how many
+ordinary <code>/v1/turns</code> requests that one CLI invocation opens; it does not become
+a daemon-wide queue.</p><h2 id=agent-construction-and-caching>Agent construction and caching</h2><p>The daemon builds pydantic-ai agents from the serialized spec. The capability
+list contains:</p><ol><li>a run-id-aware <code>StepPersistence</code> adapter;</li><li>optional file-effect evidence and harness <code>Coder</code> rooted at the request
+workspace; and</li><li><code>DBOSDurability</code> with the daemon’s stream handler.</li></ol><p>Agents are cached by the inputs that shape them, including the spec, model
+inputs, transport retry limit, output schema, workspace, tool declaration,
+store, and stream handler.
+The cache is process-local. A cached agent is run-agnostic; its run id comes
+from the individual pydantic-ai invocation.</p><p>Each local model client owns its retry limit. A context-local counter records
+physical chat completion requests for the active run. Concurrent runs do not
+share the counter or retry setting.</p><h2 id=streaming>Streaming</h2><p>The model’s <code>AgentStreamEvent</code> values are converted to <code>StreamEnvelope</code> SSE
+frames. The daemon keeps a <code>run_id → subscriber queues</code> registry only for live
+connections. Events are dropped when nobody is listening; the durable journal
+is authoritative.</p><p>DBOS may replay a durable step, so the daemon stamps request and event ordinals.
+The client deduplicates on <code>(run_id, request_ordinal, event_ordinal)</code>.
+Streaming is therefore a presentation path with replay tolerance, not the
+source of truth for history. The current request path starts the workflow before
+registering the subscriber, so an initial event can be missed. On success the
+daemon emits a final <code>turn_result</code> frame after draining live events. On
+workflow failure it emits a final <code>turn_error</code> frame; the CLI reports a finding
+and operators inspect the durable run record. When a client disconnects, its
+subscriber and local wait tasks are cleaned up while DBOS retains ownership of
+the durable workflow.</p><h2 id=module-responsibilities>Module responsibilities</h2><table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody><tr><td><code>cli.py</code></td><td>Typer commands, config/spec resolution, output validation, rendering and exit codes</td></tr><tr><td><code>config.py</code></td><td>Flat global/repository config merge and provenance</td></tr><tr><td><code>discovery.py</code></td><td>Workspace and <code>.agentman</code> directory resolution</td></tr><tr><td><code>structured_agents/spec.py</code></td><td>Provider-neutral spec discovery plus <code>output:</code> and <code>tools:</code> parsing</td></tr><tr><td><code>schema.py</code>, <code>_schema_runner.py</code></td><td>Repository-interpreter schema generation and validation</td></tr><tr><td><code>model.py</code></td><td>Model and router capability resolution</td></tr><tr><td><code>agent.py</code></td><td>pydantic-ai agent and capability construction</td></tr><tr><td><code>runtime.py</code></td><td>DBOS workflow, history loading, run lifecycle, and cache</td></tr><tr><td><code>daemon.py</code></td><td>ASGI transport, lifecycle, SSE registry, Postgres wiring and routes</td></tr><tr><td><code>client.py</code></td><td>Unix-socket HTTP client, SSE parsing, fan-out collection and deduplication</td></tr><tr><td><code>render.py</code></td><td>On-demand Markdown from stored <code>ModelMessage</code> JSON</td></tr><tr><td><code>status.py</code></td><td>Product status composed with journal facts</td></tr><tr><td><code>recovery.py</code></td><td>Resume authorization; never a replay engine</td></tr><tr><td><code>persistence/store.py</code></td><td>Product-facing thread/run CRUD</td></tr><tr><td><code>persistence/step_store.py</code></td><td>Harness <code>StepStore</code> contract over Postgres</td></tr><tr><td><code>persistence/inspect.py</code></td><td>Product-facing queries over the journal</td></tr></tbody></table><p><code>structured_agents</code> must not import <code>agentman</code>, DBOS, SQLAlchemy, or HTTP
+transport code. Import-linter contracts enforce that direction.</p></article><nav class=doc-pagination aria-label="Page navigation"><a class=doc-previous href=../../docs/reference/><span>Previous</span><strong>CLI and configuration reference</strong>
+</a><a class=doc-next href=../../docs/persistence-and-recovery/><span>Next</span><strong>Persistence and recovery</strong></a></nav></main><aside class=doc-toc aria-label="On this page"><h2>On this page</h2><nav id=TableOfContents><ul><li><a href=#design-rule>Design rule</a></li><li><a href=#system-shape>System shape</a></li><li><a href=#client-and-daemon-boundary>Client and daemon boundary</a></li><li><a href=#typed-output-flow>Typed output flow</a></li><li><a href=#model-resolution>Model resolution</a></li><li><a href=#workflow-and-concurrency>Workflow and concurrency</a></li><li><a href=#agent-construction-and-caching>Agent construction and caching</a></li><li><a href=#streaming>Streaming</a></li><li><a href=#module-responsibilities>Module responsibilities</a></li></ul></nav></aside></div><footer class=doc-footer></footer></body></html>

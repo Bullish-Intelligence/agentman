@@ -1,0 +1,57 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content="light dark"><title>ADR 0001: Record AI activity across local agents · agentman</title><link rel=stylesheet href=../../../css/docs.css><script defer src=../../../js/docs.js></script></head><body class=doc-site><a class=doc-skip href=#doc-main>Skip to content</a><header class=doc-header><a class=doc-project href=../../../>agentman</a></header><div class=doc-layout><aside class=doc-sidebar aria-label="Project navigation"><details id=doc-menu class=doc-menu open><summary class=doc-menu-toggle>Menu</summary><div class=doc-menu-content><a class=doc-sidebar-title href=../../../>agentman</a><nav aria-label=Documentation><ul class=doc-nav><li><a class=doc-nav-link href=../../../>agentman</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/>agentman documentation</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/overview/>Overview</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/getting-started/>Getting started</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/reference/>CLI and configuration reference</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/architecture/>Architecture</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/persistence-and-recovery/>Persistence and recovery</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/development/>Development guide</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/roadmap/>Roadmap and gaps</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/adr/0001-system-wide-ai-activity-record/ aria-current=page>ADR 0001: Record AI activity across local agents</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/adr/0002-external-coding-agent-jobs/>ADR 0002: Launch and track external coding-agent jobs</a></li></ul></nav></div></details></aside><main id=doc-main class=doc-content><article><h1 id=adr-0001-record-ai-activity-across-local-agents>ADR 0001: Record AI activity across local agents</h1><p>Date: 2026-10-03<br>Status: Rejected after concept review on 2026-10-20</p><h2 id=review-outcome>Review outcome</h2><p>The concept review rejects this candidate design. The user needs live command search and an exact action audit. Start the audit with the four local AI tools and shell commands. Assess raw and redacted content before a retention decision. Atuin already supplies command search. The proposed ingestion path cannot prove a full audit when hosts omit events. Test source evidence before proposing another store. Agentman remains focused on its typed-agent runtime. This outcome does not change deployment acceptance.</p><p>The text below preserves the rejected proposal for context. It does not authorize implementation.</p><h2 id=context>Context</h2><p>agentman runs typed agents and records their turns in Postgres. Its daemon owns
+the DBOS workflow, pydantic-ai agent, semantic journal, and recovery policy.
+Pi, Claude Code, and Codex run their own agent loops. Their model and tool
+activity does not pass through agentman&rsquo;s current <code>/v1/turns</code> endpoint.</p><p>The user wants one place to inspect AI work across these tools. Atuin already
+records shell commands on this machine. Its agent hooks cover Pi, Claude Code,
+and Codex. Atuin records command text, working directory, time, exit code, and
+duration. Its agent hooks cover Bash calls, not prompts, model calls, file
+tools, web tools, or final answers.</p><p>The operating model covers contract checks, portable dependencies, machine
+installation, systemd socket activation, machine Postgres, and release evidence.
+This proposal does not claim that any external-agent ingestion exists today.</p><h2 id=candidate-design>Candidate design</h2><p>The following design is a proposal. The concept review may change or reject
+it. No external-agent ingestion work is approved by this record.</p><p>agentman will provide a durable, system-wide activity record. Its current
+typed-agent runtime will be one producer of that record. External agents will
+remain responsible for their own execution and native session state.</p><p>The activity record will use the existing Postgres database and daemon-owned
+write path. It will add a versioned ingestion contract for external sessions,
+turns, and events. Each accepted event will retain its source, source event ID,
+source session and turn IDs when available, workspace, event time, ingest time,
+event kind, and original payload. A small common event vocabulary will support
+cross-tool queries. Source-specific fields will remain available without
+forcing unlike events into one shape. Ingestion will deduplicate retries by
+source identity and event ID. An adapter must assign a stable ID when its host
+does not provide one. Unified reads will use the existing product and journal
+stores for native runs and the new ingest store for external events. They will
+not copy native journal rows into a second event store.</p><p>Imported events will not be inserted into DBOS-owned tables or the harness
+<code>step_persistence</code> journal as if agentman had executed them. A native run keeps
+its existing canonical DBOS workflow ID and recovery contract. An external
+turn carries the source&rsquo;s identity and an explicit <code>observed</code> provenance.
+Agentman will not offer DBOS resume for external turns.</p><p>Atuin will remain the owner of command history. Agentman will not install a
+second Bash recorder or copy every Atuin command into its database. A combined
+view will query Atuin through a supported read-only interface and show its
+command records beside agent activity. The first version may correlate by
+source, workspace, and time. It must label that link as inferred. An exact
+per-turn link requires an adapter to retain both the Atuin history ID and the
+agent tool-call or turn ID. That link is separate follow-up work.</p><p>Agent adapters will use each host&rsquo;s supported event surface:</p><ul><li>Pi: a global extension for messages, provider activity, and tool events.</li><li>Claude Code: lifecycle hooks and OpenTelemetry export.</li><li>Codex: supported local hooks and OpenTelemetry export.</li></ul><p>Hooks and telemetry may report the same action. Adapters will preserve source
+IDs and deduplicate where the host provides stable correlation. Each view will
+state its coverage and gaps. It will not claim that all activity was captured
+when a host omitted, redacted, or failed to deliver an event.</p><p>The ingest design must handle a stopped daemon without discarding events the
+adapters accepted. A local spool or equivalent retry path will hold unsent
+events. The daemon will acknowledge only durable writes. Before collecting prompt bodies,
+tool inputs, or responses, the implementation must define content controls,
+redaction, access, and retention. The local socket permission boundary remains
+<code>0600</code>.</p><h2 id=consequences>Consequences</h2><ul><li>Users can inspect native and external AI activity through one agentman
+interface while keeping each tool&rsquo;s execution model.</li><li>Atuin keeps its command search and history. Agentman adds the conversation
+and model context that Atuin does not collect.</li><li>External records have observation guarantees, not agentman&rsquo;s native DBOS
+execution and recovery guarantees.</li><li>Source adapters must track host API changes. The record keeps original
+payloads so a common view does not discard available evidence.</li><li>OpenTelemetry is an input format, not the canonical product model. Its
+exporters can omit or redact content, and its transport does not promise
+end-to-end delivery across collectors.</li></ul><h2 id=possible-delivery-order-and-acceptance>Possible delivery order and acceptance</h2><ol><li>Complete the machine operating model. Record its acceptance evidence before
+starting external-agent ingestion.</li><li>Define and test the external event contract, durable acknowledgment,
+idempotency, provenance, and coverage labels.</li><li>Add one Pi session adapter and show a session with its Atuin commands.
+Label time-based command matches as inferred.</li><li>Add Claude Code and Codex adapters. Test each host&rsquo;s actual emitted events,
+redaction settings, duplicate delivery, daemon outage, and partial sessions.</li><li>Add exact Atuin command links only when the host and Atuin provide stable
+IDs through supported interfaces.</li></ol><p>The work does not require agentman to become an Anthropic or OpenAI API proxy.
+A gateway remains a separate decision if enforced model routing becomes a
+requirement. This proposal does not authorize automatic replay of external
+tools, a second database, or a claim of complete capture from unsupported
+hosts or hosted tool paths.</p><h2 id=references>References</h2><ul><li><a href=../../../docs/architecture/>Current agentman architecture</a></li><li><a href=https://docs.atuin.sh/main/guide/agent-hooks/>Atuin agent hooks</a></li><li><a href=https://docs.atuin.sh/main/ai/mcp/>Atuin read-only history interface</a></li><li><a href=https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md>Pi extensions</a></li><li><a href=https://code.claude.com/docs/en/hooks>Claude Code hooks</a></li><li><a href=https://code.claude.com/docs/en/monitoring-usage>Claude Code monitoring</a></li><li><a href=https://learn.chatgpt.com/docs/hooks>Codex hooks</a></li><li><a href=https://learn.chatgpt.com/docs/config-file/config-advanced>Codex telemetry</a></li><li><a href=https://opentelemetry.io/docs/specs/otlp/>OpenTelemetry Protocol delivery limits</a></li></ul></article><nav class=doc-pagination aria-label="Page navigation"><a class=doc-previous href=../../../docs/roadmap/><span>Previous</span><strong>Roadmap and gaps</strong>
+</a><a class=doc-next href=../../../docs/adr/0002-external-coding-agent-jobs/><span>Next</span><strong>ADR 0002: Launch and track external coding-agent jobs</strong></a></nav></main><aside class=doc-toc aria-label="On this page"><h2>On this page</h2><nav id=TableOfContents><ul><li><a href=#review-outcome>Review outcome</a></li><li><a href=#context>Context</a></li><li><a href=#candidate-design>Candidate design</a></li><li><a href=#consequences>Consequences</a></li><li><a href=#possible-delivery-order-and-acceptance>Possible delivery order and acceptance</a></li><li><a href=#references>References</a></li></ul></nav></aside></div><footer class=doc-footer></footer></body></html>

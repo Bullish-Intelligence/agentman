@@ -1,0 +1,117 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content="light dark"><title>ADR 0002: Launch and track external coding-agent jobs · agentman</title><link rel=stylesheet href=../../../css/docs.css><script defer src=../../../js/docs.js></script></head><body class=doc-site><a class=doc-skip href=#doc-main>Skip to content</a><header class=doc-header><a class=doc-project href=../../../>agentman</a></header><div class=doc-layout><aside class=doc-sidebar aria-label="Project navigation"><details id=doc-menu class=doc-menu open><summary class=doc-menu-toggle>Menu</summary><div class=doc-menu-content><a class=doc-sidebar-title href=../../../>agentman</a><nav aria-label=Documentation><ul class=doc-nav><li><a class=doc-nav-link href=../../../>agentman</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/>agentman documentation</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/overview/>Overview</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/getting-started/>Getting started</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/reference/>CLI and configuration reference</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/architecture/>Architecture</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/persistence-and-recovery/>Persistence and recovery</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/development/>Development guide</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/roadmap/>Roadmap and gaps</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/adr/0001-system-wide-ai-activity-record/>ADR 0001: Record AI activity across local agents</a></li><li><a class="doc-nav-link doc-nav-nested" href=../../../docs/adr/0002-external-coding-agent-jobs/ aria-current=page>ADR 0002: Launch and track external coding-agent jobs</a></li></ul></nav></div></details></aside><main id=doc-main class=doc-content><article><h1 id=adr-0002-launch-and-track-external-coding-agent-jobs>ADR 0002: Launch and track external coding-agent jobs</h1><p>Date: 2026-10-20<br>Status: Proposed for requirements review</p><h2 id=context>Context</h2><p>Agentman runs typed pydantic-ai agents in DBOS workflows. Its harness records
+the work those agents perform. The optional <code>Coder</code> toolset provides an
+unrestricted shell. That shell can start Claude Code, Codex, Pi, or Zellij.
+Today, agentman records the launch command. It has no job identity, status,
+result, or safe recovery path for work that continues in the child process.
+<a href=../../../docs/architecture/>Architecture</a>
+,
+<a href=../../../docs/persistence-and-recovery/>persistence and recovery</a>
+.</p><p>The user wants to start a coding-agent request from agentman, let it continue
+after the current terminal disconnects, and inspect its status and result.
+A Claude Code session inside detached Zellij is one possible presentation.
+The first required flow is a detached task with a status and final result.</p><p>Claude Code supports programmatic requests, structured output, and session
+resume. Codex supports non-interactive execution, structured events, and
+session resume. Pi supports a long-running JSON Lines remote procedure call
+(RPC) process and named session selection. These interfaces offer a path to
+control each host without interpreting terminal text.
+<a href=https://code.claude.com/docs/en/headless>Claude Code programmatic use</a>
+,
+<a href=https://learn.chatgpt.com/docs/non-interactive-mode>Codex non-interactive mode</a>
+,
+<a href=https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md>Pi RPC</a>
+.</p><p><a href=../../../docs/adr/0001-system-wide-ai-activity-record/>ADR 0001</a>
+rejected a general
+cross-tool ingestion service. The evidence report
+found no complete cross-tool audit or exact Atuin-to-host tool-call link.
+This proposal concerns only jobs that agentman starts. It does not reopen the
+general audit design. Deployment checks remain separate.</p><h2 id=confirmed-requirements>Confirmed requirements</h2><p>The user confirmed these requirements on 2026-10-20:</p><ol><li>The first experience is a detached task with status and result.</li><li>Both a user command and an agentman agent tool may start a job.</li><li>The first version supports Claude Code, Codex, and Pi.</li><li>A job that edits files works in an isolated workspace.</li><li>Unattended tool requests use a configured allowlist. A request outside
+that allowlist must stop or wait for approval.</li><li>The first version starts new host sessions. Resuming an existing host
+session is later work.</li><li>The user reviews and integrates changes from each isolated workspace.</li><li>Agentman retains the full structured event stream for each job it starts.</li><li>A request outside the allowlist waits for approval, then stops after a
+timeout.</li><li>An attachable Zellij session is optional later work.</li><li>Agentman stores a redacted copy of every received structured event. It
+links to the host&rsquo;s native raw record instead of copying raw content.</li><li>The caller sets a spending limit for each job. The limit is advisory.
+Agentman may start a job when the host cannot enforce the limit.</li><li>The default approval-wait timeout is 10 minutes. The caller can set a
+finite, positive timeout for a job.</li><li>Agentman retains job records and redacted events without automatic expiry.
+The host controls retention of its native raw record. The link can expire.</li><li>The job owner may read and export redacted events. A project administrator
+needs an explicit, recorded grant. An agent tool may read only its own
+authorized job. Only the owner may see the native raw link.</li></ol><p>All three hosts must satisfy the first-version contract. Implementations and
+probes may proceed one host at a time. A Claude-only release would not meet
+the confirmed host scope.</p><h2 id=proposed-product-boundary>Proposed product boundary</h2><p>Agentman would accept a user command or an agent tool call to start an
+external coding-agent job. It would return a stable agentman job ID without
+waiting for the host task to finish. The caller could inspect status and read
+the final result. A job would record the parent agentman run ID when an
+agent tool requested the launch.</p><p>The external host would own its agent loop, model calls, tool permissions,
+native session, and transcript. Agentman would own the launch request, job
+identity, process supervision, and status view. The host session ID would
+remain distinct from the agentman job ID and any DBOS run ID.</p><p>The first version would use one job contract with adapters for Claude Code,
+Codex, and Pi. Each adapter must report the same required job states, final
+result, and structured events. Each job starts a new native host session.
+An attachable Zellij terminal can follow in a later version.</p><p>The job record would keep control metadata: host, workspace, request time,
+launch state, native session ID when known, process handle, exit status,
+result location, and a parent run ID when present. It would also persist the
+host-emitted structured event stream and link to the native transcript.
+The stream records what the host emitted and agentman received. It cannot
+prove that the host emitted every action. Missing sequence, dropped output,
+redaction, and truncation must appear as coverage gaps. Agentman would keep
+each received event with stable source IDs, order, status, and a redacted
+payload. It would label changed or removed fields. The native host keeps the
+raw transcript. A &ldquo;full stream&rdquo; means all received event records, not exact
+raw payload bytes or proof of all host actions. Agentman keeps these records
+without automatic expiry. External events must not enter the harness journal
+as agentman-executed tool effects.</p><h3 id=candidate-user-flow>Candidate user flow</h3><ol><li>A user command or agent tool selects a host and request for a new session.
+It supplies a per-job spending limit and may override the project&rsquo;s
+approval-wait timeout. Agentman creates an isolated editing workspace.</li><li>Agentman creates a job ID and records launch intent before starting the
+host process.</li><li>The adapter starts the host through a supported interface. It records the
+native session ID and a way to locate the process or terminal.</li><li>Agentman returns the job ID after it can find the launched job again.</li><li>The caller asks for status, structured events, result, or cancellation by
+job ID.</li><li>Agentman reports the host result and exit status when both are available.</li><li>The user reviews and integrates any workspace changes. Agentman does not
+merge or push them as part of job completion.</li></ol><p>This flow is a proposal. It does not assert that the current daemon can keep
+a detached child alive across a service restart. A probe must establish that
+property before an accepted job receives a durability claim.</p><h2 id=identity-and-failure-rules>Identity and failure rules</h2><table><thead><tr><th>Condition</th><th>Proposed treatment</th></tr></thead><tbody><tr><td>Host accepted a request</td><td>Keep the host session ID and its native record reference.</td></tr><tr><td>Process exited</td><td>Record its exit status. Check the host result before calling the job complete.</td></tr><tr><td>Daemon restarted</td><td>Reconcile the known process or terminal and native session before changing job status.</td></tr><tr><td>Launch outcome is uncertain</td><td>Mark the job uncertain. Do not start the request again without proof that the first launch failed.</td></tr><tr><td>Host asks for approval</td><td>Apply the configured allowlist. Wait for a request outside it, then stop after 10 minutes or the job override. Record both states.</td></tr><tr><td>Spending limit is reached</td><td>Request host cancellation when reported spend reaches the limit. Record the request, observed exit, and final spend when available. Show unknown spend or possible overrun when the host cannot report or stop promptly.</td></tr><tr><td>Caller cancels a job</td><td>Ask the host to stop, then record the observed process and host states.</td></tr><tr><td>Host transcript is missing</td><td>Show the record gap. Do not infer that no tool action occurred.</td></tr></tbody></table><p>An agentman DBOS workflow may record an agent tool&rsquo;s request to start a job.
+The user command uses the same job contract. A DBOS run ID does not make the
+external host&rsquo;s actions replayable. The harness <code>StepPersistence</code> journal
+must not represent those actions as agentman tool effects. An external job
+needs its own status and recovery rules.</p><h2 id=options-considered>Options considered</h2><table><thead><tr><th>Option</th><th>Benefit</th><th>Limit</th></tr></thead><tbody><tr><td>Use <code>Coder</code> shell alone</td><td>Works for manual launch now.</td><td>No managed job identity, status, cancellation, or restart reconciliation.</td></tr><tr><td>Add host adapters, a job record, and structured events</td><td>Supports a named handoff, status, result, and emitted-event review.</td><td>Requires process, stream, storage, and version checks for all three hosts.</td></tr><tr><td>Make Zellij the job record</td><td>Provides a terminal that a user can attach to.</td><td>A terminal session alone does not prove host completion or preserve host IDs.</td></tr><tr><td>Build the ADR 0001 ingestion service</td><td>Could collect wider reported activity.</td><td>Does not solve launch ownership or prove complete capture.</td></tr></tbody></table><h2 id=privacy-and-operating-cost>Privacy and operating cost</h2><p>A launch request may contain private source or secrets. A structured event
+stream may repeat them. The first version would persist a redacted copy of
+the events agentman receives. It would link to the host&rsquo;s native raw record.
+Redaction must happen before agentman persists, indexes, or logs event bodies.
+Agentman keeps the redacted copy without automatic expiry. Native raw records
+may disappear under host retention rules. Perpetual retention needs storage
+planning, backup handling, and an explicit deletion path before
+implementation. Redaction can remove audit and mining detail, and unknown
+secret patterns can survive it. A missed secret would remain until deletion.
+The synthetic comparison
+showed that a live deletion left raw test secrets in a backup.</p><h3 id=access-rule>Access rule</h3><p>The job owner is the user who starts the command or authorizes the parent
+agentman run. Give that owner read and export access to the job&rsquo;s redacted
+events. The owner may give a project administrator an explicit, recorded grant.
+An agent tool may read status, result, and redacted events only for jobs that its
+authorized parent run started. Do not give an agent tool general export access.
+Show the native raw link only to the job owner. Opening it must still pass the
+host&rsquo;s native file or session permissions. Agentman must not proxy raw content
+or elevate access to it. Record who reads or exports redacted events and who
+requests the raw link. This rule follows least-privilege guidance for log data
+in the <a href=https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html>OWASP Logging Cheat Sheet</a>
+.
+The user confirmed this access rule on 2026-10-20.</p><p>Each adapter must track host interface versions, authentication, permission
+behavior, process exit, session location, and workspace access. The daemon
+user must have the required host credentials and file permissions. An
+editing job needs an isolated workspace and an integration path for its
+changes. The three-host scope adds three compatibility and permission gates.
+Perpetual records make storage growth and backup recovery ongoing costs.
+The stream adds backpressure, export, and schema-change costs. An
+isolated workspace remains available until the user reviews its changes.
+These costs belong to the job feature.</p><h2 id=first-evidence-gate>First evidence gate</h2><p>Settle the remaining requirements below. Then test each host in an isolated
+workspace with a synthetic request. A controlled model call would require a
+separate cost cap and explicit authorization.</p><p>For each host, an end-to-end test must show one accepted job ID, one native
+session ID, a detached run, status during work, a final result, and the full
+received structured event stream with redacted payloads. It must test daemon
+restart, duplicate launch prevention, cancellation, a failed event write, and
+a tool request outside the allowlist. The adapter must prove that it waits
+and stops after 10 minutes or the job override. Test a caller-set spending
+limit for each host. Record whether the host reports spend, accepts a stop
+request, and confirms its final spend. Mark unsupported or untested parts.
+An unenforceable spending limit does not block launch. Compare its stream with
+the host&rsquo;s native record. Mark every omission, redaction, and truncation.
+The first version needs this evidence for Claude Code, Codex, and Pi.</p><h2 id=open-requirements>Open requirements</h2><ol><li>Which spending unit does the caller enter? How does agentman report spend
+when a host reports only tokens or no cost?</li><li>What should the adapter do if a host cannot pause an approval request?</li><li>Which fields must the redactor remove before persistence?</li><li>How do explicit deletion, backup handling, and completed workspace cleanup
+work with perpetual job records and redacted events?</li></ol><p>This ADR remains proposed until the user settles these requirements and a
+bounded host probe supports the selected flow. It authorizes no process
+launcher, host adapter, or transcript ingestion.</p></article><nav class=doc-pagination aria-label="Page navigation"><a class=doc-previous href=../../../docs/adr/0001-system-wide-ai-activity-record/><span>Previous</span><strong>ADR 0001: Record AI activity across local agents</strong></a></nav></main><aside class=doc-toc aria-label="On this page"><h2>On this page</h2><nav id=TableOfContents><ul><li><a href=#context>Context</a></li><li><a href=#confirmed-requirements>Confirmed requirements</a></li><li><a href=#proposed-product-boundary>Proposed product boundary</a><ul><li><a href=#candidate-user-flow>Candidate user flow</a></li></ul></li><li><a href=#identity-and-failure-rules>Identity and failure rules</a></li><li><a href=#options-considered>Options considered</a></li><li><a href=#privacy-and-operating-cost>Privacy and operating cost</a><ul><li><a href=#access-rule>Access rule</a></li></ul></li><li><a href=#first-evidence-gate>First evidence gate</a></li><li><a href=#open-requirements>Open requirements</a></li></ul></nav></aside></div><footer class=doc-footer></footer></body></html>
