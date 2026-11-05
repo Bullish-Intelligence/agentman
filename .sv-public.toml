@@ -1,0 +1,15 @@
+[public]
+pages = [
+    'README.md',
+    'docs/README.md',
+    'docs/adr/0001-system-wide-ai-activity-record.md',
+    'docs/adr/0002-external-coding-agent-jobs.md',
+    'docs/architecture.md',
+    'docs/development.md',
+    'docs/getting-started.md',
+    'docs/overview.md',
+    'docs/persistence-and-recovery.md',
+    'docs/reference.md',
+    'docs/roadmap.md',
+]
+assets = []

@@ -1,0 +1,40 @@
+# devenv
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
+
+# direnv
+.direnv/
+
+# python build / venv / caches
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local check state
+.testee/
+
+# Agent and editor links
+!AGENTS.md
+!CLAUDE.md
+.agents
+.claude
+
+# Local devenv input overlay
+devenv.local.yaml
+
+# Local links and state
+.envrc
+.loci
+.devman
+.gitman
+.worktrees
+.jj/
+
+# Keep devenv.lock and uv.lock tracked.

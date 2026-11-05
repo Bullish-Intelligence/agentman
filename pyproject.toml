@@ -1,0 +1,107 @@
+[project]
+name = "agentman"
+version = "0.0.3"
+description = "A CLI for talking to typed agents. Every model call and tool call is recorded, always."
+readme = "README.md"
+requires-python = ">=3.13"
+
+authors = [
+  { name = "Bullish-Intelligence", email = "242310653+Bullish-Intelligence@users.noreply.github.com" },
+]
+
+dependencies = [
+  "pydantic>=2",
+  "pydantic-ai-slim[openai]>=2.41,<3",
+  # Capped on purpose. `WorkflowRunIdStepPersistence` overrides `for_run` and
+  # depends on how the base class resolves the run id, which is internal and
+  # not a versioned contract. An uncapped bump could break the one-canonical-ID
+  # invariant silently.
+  "pydantic-ai-harness>=0.31,<0.33",
+  # DBOS 3.0 is the latest stable release. Keep this on the current stable
+  # minor; the 3.1 line is prerelease and DBOS changes workflow storage across
+  # the major boundary.
+  "dbos>=3.0,<3.1",
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "psycopg[binary]",
+  "alembic>=1.13",
+  "typer",
+  "httpx>=0.28",
+  "httpx2>=2.12,<3",
+  "uvicorn",
+  "pyyaml",
+  "inferference",
+]
+
+# The dev group declares the check tools directly so `uv sync` installs them.
+# Keep `uv.lock` in Git: the checks and the application use the same locked
+# environment.
+[dependency-groups]
+dev = ["import-linter", "pytest", "pytest-asyncio", "ruff", "ty"]
+
+[tool.uv.sources]
+# The agentman contract: ``resolve_router_url``, ``config_dir``, per-model
+# ``n_parallel``/``n_ctx``, and ``loaded``. agentman never parses the router's
+# argv; that reads inside inferference.
+# The pin points at the public inferference repository.
+inferference = { git = "https://github.com/Bullish-Intelligence/inferference.git", rev = "5bcf4979fe3365a4a66ec25654da1ab09bffc5ba" }
+
+# inferference v0.3.0 omits its Hatch build backend from its own metadata. Keep
+# the dependency usable by isolated builds.
+[tool.uv.extra-build-dependencies]
+inferference = ["hatchling"]
+
+[project.scripts]
+agentman = "agentman.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentman", "src/structured_agents", "migrations"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = [
+  "integration: needs Postgres or the live model rig; set AGENTMAN_RUN_INTEGRATION=1",
+]
+
+[tool.importlinter]
+root_package = "agentman"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "structured_agents never imports agentman"
+type = "forbidden"
+source_modules = ["structured_agents"]
+forbidden_modules = ["agentman"]
+
+[[tool.importlinter.contracts]]
+# The daemon is the only Postgres client. `ls`, `show` and `status` are socket
+# requests, not queries. In development everything shares one venv, so only this
+# contract catches a direct import.
+name = "the client never reaches Postgres"
+type = "forbidden"
+source_modules = ["agentman.cli", "agentman.client"]
+forbidden_modules = ["agentman.persistence", "sqlalchemy", "asyncpg"]
+# `agentman serve` starts the daemon in this process, so the command module
+# imports it. That one edge is the daemon entry point, not a client query.
+ignore_imports = ["agentman.cli -> agentman.daemon"]
+
+[[tool.importlinter.contracts]]
+name = "structured_agents stays provider-neutral"
+type = "forbidden"
+source_modules = ["structured_agents"]
+forbidden_modules = ["dbos", "sqlalchemy", "httpx"]
