@@ -19,11 +19,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
+from pydantic import TypeAdapter
 from pydantic_ai import Agent, StructuredDict
 from pydantic_ai.agent.abstract import EventStreamHandler
 from pydantic_ai.agent.spec import AgentSpec
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.durable_exec.dbos import DBOSDurability
+from pydantic_ai.messages import ModelResponseStreamEvent
 from pydantic_ai.models import Model
 from pydantic_ai.tools import RunContext
 from pydantic_ai_harness.coder import Coder
@@ -31,6 +33,24 @@ from pydantic_ai_harness.step_persistence import StepPersistence, StepStore
 
 from agentman.effects import FileEffectEvidence
 from structured_agents import ToolSpec
+
+_STREAM_EVENT_ADAPTER = TypeAdapter(ModelResponseStreamEvent)
+
+
+class _SerializableDBOSDurability(DBOSDurability):
+    """Remove transient callbacks before DBOS pickles captured model events.
+
+    Provider detail callbacks exist only while deltas merge in memory. Pydantic
+    AI's JSON serializer drops them and preserves the visible event content.
+    """
+
+    async def _model_request_stream_operation(self, params: Any) -> Any:
+        result = await super()._model_request_stream_operation(params)
+        result.events = [
+            _STREAM_EVENT_ADAPTER.validate_python(_STREAM_EVENT_ADAPTER.dump_python(event, mode="json"))
+            for event in result.events
+        ]
+        return result
 
 
 @dataclass
@@ -120,7 +140,7 @@ def turn_capabilities(
         # permissions are the access boundary for this system-level capability.
         capabilities.append(FileEffectEvidence(store=store, workspace=workspace))
         capabilities.append(_coder(workspace))
-    capabilities.append(DBOSDurability(event_stream_handler=event_stream_handler, name=durability_name))
+    capabilities.append(_SerializableDBOSDurability(event_stream_handler=event_stream_handler, name=durability_name))
     return capabilities
 
 
