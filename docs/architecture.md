@@ -183,8 +183,20 @@ registering the subscriber, so an initial event can be missed. On success the
 daemon emits a final `turn_result` frame after draining live events. On
 workflow failure it emits a final `turn_error` frame; the CLI reports a finding
 and operators inspect the durable run record. When a client disconnects, its
-subscriber and local wait tasks are cleaned up while DBOS retains ownership of
-the durable workflow.
+subscriber and local wait tasks are cleaned up. The daemon also cancels the
+DBOS workflow and records `client_disconnected` on the run.
+
+## Cancellation
+
+The daemon cancels a workflow with `DBOS.cancel_workflow_async`. Only the model
+step is preemptible. DBOS then cancels the model task and closes its upstream
+stream. Tool steps stay non-preemptible so their side-effect records remain
+complete.
+
+When the cancelled workflow unwinds, the runtime records usage and metadata
+directly through the product store. It cannot use another DBOS step after
+cancellation. The daemon records the terminal status and reason, then sends a
+final `turn_error` frame when the client remains connected.
 
 ## Module responsibilities
 

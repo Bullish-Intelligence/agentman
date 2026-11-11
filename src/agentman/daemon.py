@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from typing import Any
 
 from dbos import DBOS, DBOSConfig
+from dbos._error import DBOSAwaitedWorkflowCancelledError
 from inferference import InferferenceClient
 from pydantic import TypeAdapter
 from pydantic_ai.messages import AgentStreamEvent
@@ -29,13 +31,14 @@ from agentman.model import ModelResolutionError, require_schema, resolve_capabil
 from agentman.persistence.engine import create_engine
 from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
-from agentman.persistence.store import Store
+from agentman.persistence.store import RUN_CANCELLED, RUN_TERMINAL, Store
 from agentman.protocol import (
     PROTOCOL_VERSION,
     ErrorResponse,
     NewThreadRequest,
     ResumeRequest,
     ResumeResponse,
+    RunError,
     StatusRequest,
     StreamEnvelope,
     ThreadList,
@@ -45,10 +48,11 @@ from agentman.protocol import (
     TurnResponse,
 )
 from agentman.recovery import ResumeRefused, authorize_resume
-from agentman.runtime import Turn, configure_runtime, execute
+from agentman.runtime import Turn, configure_runtime, execute, usage_so_far
 from agentman.status import compose_status, run_info, thread_info, thread_messages
 
 _STREAM_ADAPTER = TypeAdapter(AgentStreamEvent)
+logger = logging.getLogger(__name__)
 
 
 class SubscriberRegistry:
@@ -196,16 +200,16 @@ class AgentmanApp:
         query = _query(scope.get("query_string", b""))
         try:
             body = await _read_body(receive)
-            await self._route(method, path, query, body, send)
+            await self._route(method, path, query, body, receive, send)
         except _HttpError as error:
             await _send_json(send, error.status, ErrorResponse(error=error.message).model_dump(mode="json"))
 
-    async def _route(self, method: str, path: str, query: dict[str, str], body: bytes, send: Any) -> None:
+    async def _route(self, method: str, path: str, query: dict[str, str], body: bytes, receive: Any, send: Any) -> None:
         if method == "GET" and path == "/v1/health":
             await _send_json(send, 200, {"status": "ok", "version": __version__, "protocol": PROTOCOL_VERSION})
             return
         if method == "POST" and path == "/v1/turns":
-            await self._handle_turn(body, send)
+            await self._handle_turn(body, receive, send)
             return
         if method == "POST" and path == "/v1/threads":
             request = NewThreadRequest.model_validate_json(body)
@@ -258,7 +262,7 @@ class AgentmanApp:
             return
         raise _HttpError(404, f"no route for {method} {path}")
 
-    async def _handle_turn(self, body: bytes, send: Any) -> None:
+    async def _handle_turn(self, body: bytes, receive: Any, send: Any) -> None:
         request = TurnRequest.model_validate_json(body)
         store = self._store()
         thread = await store.get_thread(request.thread_id)
@@ -291,11 +295,44 @@ class AgentmanApp:
                 "headers": [(b"content-type", b"text/event-stream"), (b"cache-control", b"no-cache")],
             }
         )
+        result_task = asyncio.create_task(handle.get_result())
+        drain_task = asyncio.create_task(_drain(queue, send))
+        disconnect_task = asyncio.create_task(_wait_disconnect(receive))
         try:
-            result_task = asyncio.create_task(handle.get_result())
-            drain_task = asyncio.create_task(_drain(queue, send))
+            done, _ = await asyncio.wait(
+                (result_task, disconnect_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                await self.cancel_run(run_id, workspace=request.workspace, reason="client_disconnected")
+                drain_task.cancel()
+                await asyncio.gather(drain_task, return_exceptions=True)
+                try:
+                    await result_task
+                except DBOSAwaitedWorkflowCancelledError:
+                    pass
+                return
+
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
             try:
-                result = await result_task
+                result = result_task.result()
+            except DBOSAwaitedWorkflowCancelledError:
+                run = await store.get_run(run_id)
+                reason = run.error.get("reason") if run is not None and run.error is not None else "workflow_cancelled"
+                self.registry.publish(run_id, None)
+                await drain_task
+                await _send_sse(
+                    send,
+                    StreamEnvelope(
+                        run_id=run_id,
+                        request_ordinal=-1,
+                        event_ordinal=-1,
+                        kind="turn_error",
+                        event={"error": "turn cancelled", "reason": reason, "run_id": run_id},
+                        final=True,
+                    ),
+                )
             except Exception:
                 self.registry.publish(run_id, None)
                 await drain_task
@@ -330,13 +367,49 @@ class AgentmanApp:
                     final=True,
                 )
                 await _send_sse(send, final)
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
         finally:
-            for task in (result_task, drain_task):
+            for task in (result_task, drain_task, disconnect_task):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(result_task, drain_task, return_exceptions=True)
+            await asyncio.gather(result_task, drain_task, disconnect_task, return_exceptions=True)
             self.registry.unsubscribe(run_id, queue)
-        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    async def cancel_run(self, run_id: str, *, workspace: str, reason: str) -> dict[str, Any]:
+        """Cancel a workflow and record the run state after DBOS accepts it."""
+        store = self._store()
+        run = await store.get_run(run_id)
+        if run is None:
+            raise _HttpError(404, f"no run {run_id!r}")
+        if run.workspace != workspace:
+            raise _HttpError(409, f"run {run_id!r} belongs to a different workspace")
+        if run.status in RUN_TERMINAL:
+            return {"run_id": run_id, "status": run.status, "cancelled": False}
+
+        await DBOS.cancel_workflow_async(run_id)
+        workflow_status = await DBOS.get_workflow_status_async(run_id)
+        status = workflow_status.status if workflow_status is not None else None
+        if status == "CANCELLED":
+            latest = await store.get_run(run_id)
+            if latest is not None and latest.status in RUN_TERMINAL:
+                return {"run_id": run_id, "status": latest.status, "cancelled": False}
+            usage = await usage_so_far(self.step_store, run_id) if self.step_store is not None else None
+            await store.update_run(
+                run_id,
+                status=RUN_CANCELLED,
+                usage=usage,
+                error=RunError(reason=reason).model_dump(mode="json"),
+            )
+            logger.info("cancelled run %s with reason %s", run_id, reason)
+            return {"run_id": run_id, "status": RUN_CANCELLED, "cancelled": True}
+        if status in {"SUCCESS", "ERROR"}:
+            latest = await store.get_run(run_id)
+            return {
+                "run_id": run_id,
+                "status": latest.status if latest is not None else run.status,
+                "cancelled": False,
+            }
+        raise _HttpError(409, f"run {run_id!r} could not be cancelled")
 
     async def _resolve_turn_model(self, request: TurnRequest) -> tuple[str, str | None, int | None]:
         if not request.model.startswith(MODEL_PREFIX):
@@ -433,6 +506,14 @@ async def _read_body(receive: Any) -> bytes:
         body += event.get("body", b"")
         if not event.get("more_body", False):
             return body
+
+
+async def _wait_disconnect(receive: Any) -> None:
+    """Wait until the ASGI client closes the request stream."""
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return
 
 
 async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:

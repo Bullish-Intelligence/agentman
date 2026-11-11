@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Protocol
 
 from dbos import DBOS
+from dbos._error import DBOSWorkflowCancelledError
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.agent.abstract import EventStreamHandler
@@ -44,7 +45,7 @@ from agentman.model import (
     build_model,
 )
 from agentman.model import PREFIX as MODEL_PREFIX
-from agentman.persistence.store import RUN_COMPLETED, RUN_FAILED
+from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_FAILED, RUN_RUNNING
 from agentman.protocol import RunError, RunMetadata
 
 logger = logging.getLogger(__name__)
@@ -314,6 +315,15 @@ def exception_error(error: BaseException) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
+def workflow_cancelled_error(error: BaseException) -> dict[str, Any]:
+    """Return the run error value for a DBOS cancellation without an agentman request."""
+    return RunError(
+        reason="workflow_cancelled",
+        type=type(error).__name__,
+        message=str(error)[:ERROR_MESSAGE_LIMIT],
+    ).model_dump(mode="json")
+
+
 async def usage_so_far(step_store: StepStore, run_id: str) -> dict[str, Any] | None:
     """Return the usage of the model responses the journal holds for ``run_id``.
 
@@ -440,6 +450,23 @@ async def run_turn(
             usage=usage,
             run_metadata=metadata,
         )
+    except DBOSWorkflowCancelledError as error:
+        metadata = _run_metadata(
+            turn,
+            physical_model_request_count=request_counter.count if request_counter is not None else None,
+        )
+        fields: dict[str, Any] = {
+            "usage": await usage_so_far(step_store, run_id),
+            "run_metadata": metadata,
+        }
+        try:
+            run = await product_store.get_run(run_id)
+            if run is not None and run.status == RUN_RUNNING:
+                fields.update(status=RUN_CANCELLED, error=workflow_cancelled_error(error))
+            await product_store.update_run(run_id, **fields)
+        except Exception:
+            logger.exception("could not record run %s after DBOS cancellation", run_id)
+        raise
     except Exception as error:
         metadata = _run_metadata(
             turn,

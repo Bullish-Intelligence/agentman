@@ -417,6 +417,44 @@ async def test_failed_run_is_recorded_as_failed() -> None:
     assert run.usage is not None and run.usage["requests"] == 2
 
 
+async def test_run_turn_records_a_cancel_without_a_dbos_step(monkeypatch) -> None:
+    import pytest
+    from dbos._error import DBOSWorkflowCancelledError
+    from pydantic_ai.messages import ModelMessage, ModelResponse
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    import agentman.runtime as runtime
+
+    async def cancel(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise DBOSWorkflowCancelledError("cancelled by DBOS")
+
+    async def forbidden_update_step(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("the cancel path must write outside a DBOS step")
+
+    step_store = InMemoryStepStore()
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    monkeypatch.setattr(runtime, "_update_run_step", forbidden_update_step)
+
+    with pytest.raises(DBOSWorkflowCancelledError, match="cancelled by DBOS"):
+        await run_turn(
+            _turn(thread.id),
+            step_store=step_store,
+            product_store=product,
+            run_id="run-cancelled",
+            model=FunctionModel(cancel, model_name="cancelled"),
+        )
+
+    run = await product.get_run("run-cancelled")
+    assert run is not None and run.status == "cancelled"
+    assert run.error is not None and run.error["reason"] == "workflow_cancelled"
+    assert run.usage is not None and run.usage["requests"] == 0
+
+    await product.update_run("run-cancelled", output_json={"writable": True})
+    updated = await product.get_run("run-cancelled")
+    assert updated is not None and updated.output_json == {"writable": True}
+
+
 async def test_usage_so_far_counts_only_the_responses_of_its_own_run() -> None:
     """A snapshot carries the thread history; earlier runs must not count."""
     step_store = InMemoryStepStore()
