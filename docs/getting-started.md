@@ -242,5 +242,7 @@ agentman cancel <run-id>
 ```
 
 Use `--thread NAME` to cancel running turns in one named thread. Use
-`--all-running` to cancel every running turn in the current workspace. A
-client disconnect also cancels its running turn.
+`--all-running` to cancel every running turn in the current workspace. These
+selectors try every run. The exit code is `2` if any run failed with an error,
+else `1` if any run was already final, else `0`. A client disconnect also
+cancels its running turn.

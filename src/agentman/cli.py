@@ -11,11 +11,14 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
+import httpx
 import typer
+from pydantic import ValidationError
 from typer.core import TyperCommand, TyperGroup, _click
 
 from agentman import __version__
@@ -301,14 +304,26 @@ def cancel(
                 typer.echo("no running run")
                 return
 
+            # A selector can pick several runs. Try each run, then report the
+            # worst result: an error (2), a run that was already final (1), or ok.
             finding = False
+            errored = False
             for selected_run_id in selected:
-                result = await client.cancel_run(selected_run_id, workspace=context.workspace)
+                try:
+                    result = await client.cancel_run(selected_run_id, workspace=context.workspace)
+                except _DAEMON_FAILURES as error:
+                    if run_id is not None:
+                        raise
+                    typer.echo(f"error: cancel {selected_run_id}: {_daemon_failure_message(error)}", err=True)
+                    errored = True
+                    continue
                 if result.cancelled:
                     typer.echo(f"cancelled {selected_run_id}")
                 else:
                     typer.echo(f"not cancelled {selected_run_id}: already {result.status}")
                     finding = True
+            if errored:
+                raise typer.Exit(EXIT_CONFIG)
             if finding:
                 raise typer.Exit(EXIT_FINDING)
 
@@ -445,18 +460,21 @@ async def _one_turn(
         )
         final: TurnResponse | None = None
         stream_error: str | None = None
-        async for envelope in client.stream_turn(request):
-            if envelope.kind == "turn_error":
-                error_message = envelope.event.get("error")
-                stream_error = error_message if isinstance(error_message, str) else "the daemon reported a failed turn"
-                continue
-            if envelope.final:
-                if envelope.kind != "turn_result":
-                    stream_error = f"the daemon sent unknown final frame {envelope.kind!r}"
+        async with aclosing(client.stream_turn(request)) as stream:
+            async for envelope in stream:
+                if envelope.kind == "turn_error":
+                    error_message = envelope.event.get("error")
+                    stream_error = (
+                        error_message if isinstance(error_message, str) else "the daemon reported a failed turn"
+                    )
                     continue
-                final = TurnResponse.model_validate(envelope.event)
-            elif not json_output:
-                _print_delta(envelope)
+                if envelope.final:
+                    if envelope.kind != "turn_result":
+                        stream_error = f"the daemon sent unknown final frame {envelope.kind!r}"
+                        continue
+                    final = TurnResponse.model_validate(envelope.event)
+                elif not json_output:
+                    _print_delta(envelope)
 
     if stream_error is not None:
         _fail(stream_error, EXIT_FINDING)
@@ -513,7 +531,7 @@ async def _fan_out(
     failures: list[tuple[int, int, str]] = []
     for outcome in outcomes:
         if outcome.error is not None:
-            failures.append((outcome.index, _fanout_error_code(outcome.error), str(outcome.error)))
+            failures.append((outcome.index, _fanout_error_code(outcome.error), _fanout_error_text(outcome.error)))
             continue
         if outcome.response is None:
             failures.append((outcome.index, EXIT_FINDING, "the daemon ended the stream without a result"))
@@ -682,6 +700,12 @@ def _fanout_error_code(error: Exception) -> int:
     return EXIT_CONFIG
 
 
+def _fanout_error_text(error: Exception) -> str:
+    if isinstance(error, httpx.TransportError | ValidationError):
+        return _daemon_failure_message(error)
+    return str(error)
+
+
 def _print_delta(envelope: Any) -> None:
     event = envelope.event
     kind = event.get("event_kind")
@@ -748,12 +772,29 @@ def _call(coro_factory: Any) -> None:
         _fail(str(error))
     except DaemonError as error:
         _fail(str(error), EXIT_CONFIG if error.status_code is not None else EXIT_FINDING)
+    except (httpx.TransportError, ValidationError) as error:
+        _fail(_daemon_failure_message(error))
     except ModelResolutionError as error:
         _fail(str(error))
     except SpecError as error:
         _fail(str(error))
     except SchemaError as error:
         _fail(str(error))
+
+
+# The failures that mean the daemon could not answer, or answered in a form
+# this client cannot read.
+_DAEMON_FAILURES = (DaemonNotRunning, DaemonError, httpx.TransportError, ValidationError)
+
+
+def _daemon_failure_message(error: Exception) -> str:
+    """Return the text for a failed daemon call."""
+    if isinstance(error, httpx.TransportError):
+        detail = str(error) or type(error).__name__
+        return f"lost the connection to the daemon ({detail}); check that `agentman serve` is running"
+    if isinstance(error, ValidationError):
+        return "the daemon sent a response this client cannot read; upgrade the client and daemon together"
+    return str(error)
 
 
 def _load_agent(context: Context, name: str):

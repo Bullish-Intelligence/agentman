@@ -7,8 +7,10 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import typer
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 import agentman.cli as cli
@@ -17,7 +19,7 @@ from agentman.client import DaemonError, TurnOutcome
 from agentman.config import CONFIG_FILENAME, Config, ConfigError, Value
 from agentman.discovery import Directories
 from agentman.model import ModelResolutionError
-from agentman.protocol import PROTOCOL_VERSION, StreamEnvelope, TurnResponse
+from agentman.protocol import PROTOCOL_VERSION, CancelRequest, StreamEnvelope, TurnResponse
 from agentman.schema import OutputValidationError
 
 
@@ -762,3 +764,196 @@ def test_cancel_requires_exactly_one_selector(arguments: list[str]) -> None:
 
     assert result.exit_code == cli.EXIT_USAGE, result.output
     assert "exactly one" in result.output
+
+
+def _cancel_client(*, runs: list[tuple[str, str]], results: dict[str, object]) -> object:
+    """Build a fake client. ``runs`` are (run id, status); a result may be an exception."""
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return ["cancel"]
+
+        async def list_threads(self, *, workspace: str) -> list[SimpleNamespace]:
+            return [SimpleNamespace(id="thread-1")]
+
+        async def get_thread(self, thread_id: str) -> SimpleNamespace:
+            return SimpleNamespace(runs=[SimpleNamespace(id=run, status=status) for run, status in runs])
+
+        async def cancel_run(self, run_id: str, *, workspace: str) -> SimpleNamespace:
+            result = results[run_id]
+            if isinstance(result, Exception):
+                raise result
+            return SimpleNamespace(run_id=run_id, status=result, cancelled=result == "cancelled")
+
+    return FakeClient()
+
+
+def test_cancel_all_running_continues_after_an_error_and_exits_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    fake = _cancel_client(
+        runs=[("run-1", "running"), ("run-2", "running"), ("run-3", "running")],
+        results={
+            "run-1": "cancelled",
+            "run-2": DaemonError("daemon returned 409: not cancellable", status_code=409),
+            "run-3": "completed",
+        },
+    )
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: fake)
+
+    result = CliRunner().invoke(app, ["cancel", "--all-running"])
+
+    assert result.exit_code == cli.EXIT_CONFIG, result.output
+    assert "cancelled run-1" in result.output
+    assert "error: cancel run-2: daemon returned 409: not cancellable" in result.output
+    assert "not cancelled run-3: already completed" in result.output
+
+
+def test_cancel_thread_exits_one_when_a_run_was_already_final(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    fake = _cancel_client(
+        runs=[("run-1", "running"), ("run-2", "running")],
+        results={"run-1": "cancelled", "run-2": "completed"},
+    )
+    fake.resolve_thread = lambda **_: asyncio.sleep(0, result=SimpleNamespace(id="thread-1"))
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: fake)
+
+    result = CliRunner().invoke(app, ["cancel", "--thread", "review"])
+
+    assert result.exit_code == cli.EXIT_FINDING, result.output
+    assert "cancelled run-1" in result.output
+    assert "not cancelled run-2: already completed" in result.output
+
+
+def test_cancel_all_running_exits_zero_when_every_run_is_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    fake = _cancel_client(
+        runs=[("run-1", "running"), ("run-2", "running")],
+        results={"run-1": "cancelled", "run-2": "cancelled"},
+    )
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: fake)
+
+    result = CliRunner().invoke(app, ["cancel", "--all-running"])
+
+    assert result.exit_code == 0, result.output
+
+
+def test_cancel_one_run_id_still_stops_on_a_daemon_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    fake = _cancel_client(runs=[], results={"run-1": DaemonError("daemon returned 404: unknown run", status_code=404)})
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: fake)
+
+    result = CliRunner().invoke(app, ["cancel", "run-1"])
+
+    assert result.exit_code == cli.EXIT_CONFIG, result.output
+    assert "daemon returned 404: unknown run" in result.output
+
+
+def test_cancel_all_running_maps_a_lost_connection_to_exit_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    fake = _cancel_client(
+        runs=[("run-1", "running"), ("run-2", "running")],
+        results={"run-1": httpx.ReadError("boom"), "run-2": "cancelled"},
+    )
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: fake)
+
+    result = CliRunner().invoke(app, ["cancel", "--all-running"])
+
+    assert result.exit_code == cli.EXIT_CONFIG, result.output
+    assert "error: cancel run-1: lost the connection to the daemon" in result.output
+    assert "cancelled run-2" in result.output
+
+
+def _invalid_cancel_response() -> ValidationError:
+    try:
+        CancelRequest.model_validate({"workspace": "/repo", "unknown_field": 1})
+    except ValidationError as error:
+        return error
+    raise AssertionError("the model accepted an extra field")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (httpx.ReadTimeout(""), "lost the connection to the daemon (ReadTimeout)"),
+        (httpx.RemoteProtocolError("server disconnected"), "lost the connection to the daemon (server disconnected)"),
+        (httpx.ReadError("reset"), "lost the connection to the daemon (reset)"),
+    ],
+)
+def test_call_maps_transport_errors_to_exit_two(error: Exception, expected: str, capsys) -> None:
+    async def fail() -> None:
+        raise error
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._call(fail)
+
+    assert exit_info.value.exit_code == cli.EXIT_CONFIG
+    assert expected in capsys.readouterr().err
+
+
+def test_call_maps_a_protocol_skew_to_exit_two(capsys) -> None:
+    error = _invalid_cancel_response()
+
+    async def fail() -> None:
+        raise error
+
+    with pytest.raises(typer.Exit) as exit_info:
+        cli._call(fail)
+
+    assert exit_info.value.exit_code == cli.EXIT_CONFIG
+    assert "upgrade the client and daemon together" in capsys.readouterr().err
+
+
+def test_send_closes_the_turn_stream_when_the_loop_body_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, setup = _fanout_test_setup()
+    closed = False
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def stream_turn(self, request: object):
+            nonlocal closed
+            try:
+                for ordinal in range(3):
+                    yield StreamEnvelope(
+                        run_id="run-1",
+                        request_ordinal=0,
+                        event_ordinal=ordinal,
+                        kind="model_event",
+                        event={"event_kind": "part_delta"},
+                        final=False,
+                    )
+            finally:
+                closed = True
+
+    def broken_pipe(_: object) -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_prepare_turn", lambda _: setup)
+    monkeypatch.setattr(cli, "_ensure_current_thread", lambda *_: asyncio.sleep(0, result="thread-1"))
+    monkeypatch.setattr(cli, "_turn_request", lambda *_, **__: object())
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+    monkeypatch.setattr(cli, "_print_delta", broken_pipe)
+
+    async def scenario() -> None:
+        with pytest.raises(BrokenPipeError):
+            await cli._one_turn("hello", agent=None, model=None, json_output=False)
+        # No event-loop turn has run, so the garbage collector cannot have closed it.
+        assert closed
+
+    asyncio.run(scenario())

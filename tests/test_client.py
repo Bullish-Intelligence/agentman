@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
+
+import httpx
 
 from agentman.client import Client, TurnStreamError
 from agentman.protocol import StreamEnvelope, TurnRequest, TurnResponse
@@ -13,7 +16,7 @@ def test_stream_turns_preserves_input_order_and_bounds_in_flight_requests() -> N
     state = {"active": 0, "max_active": 0}
 
     class FakeClient(Client):
-        async def stream_turn(self, request: TurnRequest) -> AsyncIterator[StreamEnvelope]:
+        async def stream_turn(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
             state["active"] += 1
             state["max_active"] = max(state["max_active"], state["active"])
             try:
@@ -53,7 +56,7 @@ def test_stream_turns_preserves_input_order_and_bounds_in_flight_requests() -> N
 
 def test_stream_turns_maps_terminal_error_frame_to_finding() -> None:
     class FakeClient(Client):
-        async def stream_turn(self, request: TurnRequest) -> AsyncIterator[StreamEnvelope]:
+        async def stream_turn(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
             yield StreamEnvelope(
                 run_id="run-1",
                 request_ordinal=-1,
@@ -98,3 +101,100 @@ def test_cancel_run_posts_workspace_and_parses_response() -> None:
     assert response.run_id == "run-1"
     assert response.status == "cancelled"
     assert response.cancelled
+
+
+def _final_error_frame() -> StreamEnvelope:
+    return StreamEnvelope(
+        run_id="run-1",
+        request_ordinal=-1,
+        event_ordinal=-1,
+        kind="turn_error",
+        event={"error": "turn cancelled"},
+        final=True,
+    )
+
+
+def _delta_frame(ordinal: int) -> StreamEnvelope:
+    return StreamEnvelope(
+        run_id="run-1",
+        request_ordinal=0,
+        event_ordinal=ordinal,
+        kind="model_event",
+        event={"event_kind": "part_delta"},
+        final=False,
+    )
+
+
+def test_turn_stream_has_no_read_timeout_but_unary_calls_keep_one() -> None:
+    seen: dict[str, dict[str, float | None]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path] = dict(request.extensions["timeout"])
+        if request.url.path == "/v1/turns":
+            return httpx.Response(200, text="")
+        return httpx.Response(200, json={"status": "ok"})
+
+    async def scenario() -> None:
+        client = Client("/tmp/agentman-test.sock", timeout=12.0)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://agentman", timeout=12.0
+        )
+        async with client:
+            await client.capabilities()
+            request = TurnRequest(workspace="/repo", thread_id="thread", model="mock", prompt="hello")
+            async with aclosing(client.stream_turn(request)) as stream:
+                async for _ in stream:
+                    pass
+
+    asyncio.run(scenario())
+
+    assert seen["/v1/health"]["read"] == 12.0
+    assert seen["/v1/turns"]["read"] is None
+    assert seen["/v1/turns"]["connect"] == 12.0
+    assert seen["/v1/turns"]["write"] == 12.0
+    assert seen["/v1/turns"]["pool"] == 12.0
+
+
+def test_stream_turn_closes_the_inner_generators_when_the_consumer_stops() -> None:
+    closed: list[str] = []
+
+    class ChainClient(Client):
+        async def _raw_stream(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
+            try:
+                yield _delta_frame(0)
+                yield _delta_frame(1)
+            finally:
+                closed.append("raw")
+
+    async def scenario() -> None:
+        client = ChainClient.__new__(ChainClient)
+        request = TurnRequest(workspace="/repo", thread_id="thread", model="mock", prompt="hello")
+        async with aclosing(client.stream_turn(request)) as stream:
+            async for _ in stream:
+                break
+        # No event-loop turn has run, so the garbage collector cannot have closed it.
+        assert closed == ["raw"]
+
+    asyncio.run(scenario())
+
+
+def test_stream_turns_closes_the_stream_after_a_final_turn_error() -> None:
+    closed: list[str] = []
+
+    class ChainClient(Client):
+        async def _raw_stream(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
+            try:
+                yield _final_error_frame()
+                yield _delta_frame(1)
+            finally:
+                closed.append("raw")
+
+    async def scenario() -> None:
+        client = ChainClient.__new__(ChainClient)
+        request = TurnRequest(workspace="/repo", thread_id="thread", model="mock", prompt="hello")
+        outcome = (await client.stream_turns([request], concurrency=1))[0]
+        assert isinstance(outcome.error, TurnStreamError)
+        assert closed == ["raw"]
+
+    asyncio.run(scenario())
