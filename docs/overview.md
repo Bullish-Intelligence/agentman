@@ -63,7 +63,7 @@ ordinary runs. Capabilities are pydantic-ai/harness implementation details.
 | File-effect evidence | Implemented for `write_file` and `edit_file` | It records pre/post hashes; it is not generic exactly-once execution |
 | `status` and unresolved effects | Implemented | Earlier runs in a thread are included in unresolved-effect inspection |
 | `resume` | Implemented and policy-gated | It never silently replays an unresolved side effect |
-| Run cancellation | Implemented and tested | Model steps stop on cancel; tool steps finish; disconnects cancel |
+| Run cancellation | Implemented and tested | Model steps stop on cancel; a running tool is not stopped and leaves its effect record `started`; disconnects cancel |
 | `pipe --each -j N` | Implemented | The bound is per CLI invocation; the daemon remains unscheduled and concurrent |
 | Systemd fd handoff | Implemented in daemon code and tested | The daemon accepts one systemd listening descriptor |
 | Machine-wide install and Postgres | Configured and built; current release not active | Installation and activation are outside this repository |

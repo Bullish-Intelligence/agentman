@@ -136,6 +136,9 @@ Useful focused suites include:
 | Suite | Evidence |
 | --- | --- |
 | `test_cli.py`, `test_cli_integration.py` | command behavior and exit codes |
+| `test_agent.py` | the model step is the only preemptible DBOS step |
+| `test_cancellation.py`, `support/slow_upstream.py` | model stream cancel closes the upstream connection; the slow upstream serves the stream |
+| `test_cancel_integration.py` | cancel, disconnect, and recovery against Postgres |
 | `test_runtime.py` | workflow lifecycle, caching, canonical ids |
 | `test_daemon_integration.py` | real daemon transport and concurrency overlap |
 | `test_step_store_integration.py`, `test_store_integration.py` | Postgres product/journal behavior |

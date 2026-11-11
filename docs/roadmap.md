@@ -12,7 +12,7 @@ Core record             complete in code and tests
 Tools and recovery      complete in code and tests
 DBOS 3.0 migration      complete in code and recovery evidence
 Fan-out                 complete in code and tests
-Run cancellation       complete in code and tests
+Run cancellation       model cancel complete in code and tests; tool-step cancel has open work
 Deployment/operations   installed and verified; reboot, second-UID, clone, and sustained-router checks are documented
 Product expansion       proposed; concept review pending
 ```
@@ -21,11 +21,16 @@ Product expansion       proposed; concept review pending
 
 The daemon cancels runs by id. The CLI also selects running runs by thread or
 workspace. A client disconnect cancels its turn. The model step stops within
-about one second. An active tool step finishes so its side-effect record stays
-complete.
+about one second. A `Coder` tool step does not stop. It runs inline in the
+workflow and finishes its work. The run row already says `cancelled`. The
+harness cannot write the end of the effect record after the cancel, so the
+record stays `started` and `agentman status` lists it as unresolved. The final
+turn frame arrives after the tool returns.
 
 The next cancellation work is:
 
+- complete the effect record of a tool that finishes after a cancel;
+- report "cancel requested" while a tool still runs, instead of `cancelled`;
 - update karakeep-archive to cancel after a client timeout when health reports
   the `cancel` capability;
 - allow `max_transport_retries` for `openai:` models;
