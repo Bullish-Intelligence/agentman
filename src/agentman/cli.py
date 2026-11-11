@@ -444,20 +444,22 @@ async def _one_turn(
             max_transport_retries=max_transport_retries,
         )
         final: TurnResponse | None = None
+        stream_error: str | None = None
         async for envelope in client.stream_turn(request):
             if envelope.kind == "turn_error":
                 error_message = envelope.event.get("error")
-                _fail(
-                    error_message if isinstance(error_message, str) else "the daemon reported a failed turn",
-                    EXIT_FINDING,
-                )
+                stream_error = error_message if isinstance(error_message, str) else "the daemon reported a failed turn"
+                continue
             if envelope.final:
                 if envelope.kind != "turn_result":
-                    _fail(f"the daemon sent unknown final frame {envelope.kind!r}", EXIT_FINDING)
+                    stream_error = f"the daemon sent unknown final frame {envelope.kind!r}"
+                    continue
                 final = TurnResponse.model_validate(envelope.event)
             elif not json_output:
                 _print_delta(envelope)
 
+    if stream_error is not None:
+        _fail(stream_error, EXIT_FINDING)
     if final is None:
         _fail("the daemon ended the stream without a result", EXIT_FINDING)
     try:

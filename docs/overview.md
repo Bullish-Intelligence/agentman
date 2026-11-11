@@ -63,6 +63,7 @@ ordinary runs. Capabilities are pydantic-ai/harness implementation details.
 | File-effect evidence | Implemented for `write_file` and `edit_file` | It records pre/post hashes; it is not generic exactly-once execution |
 | `status` and unresolved effects | Implemented | Earlier runs in a thread are included in unresolved-effect inspection |
 | `resume` | Implemented and policy-gated | It never silently replays an unresolved side effect |
+| Run cancellation | Implemented and tested | Model steps stop on cancel; tool steps finish; disconnects cancel |
 | `pipe --each -j N` | Implemented | The bound is per CLI invocation; the daemon remains unscheduled and concurrent |
 | Systemd fd handoff | Implemented in daemon code and tested | The daemon accepts one systemd listening descriptor |
 | Machine-wide install and Postgres | Configured and built; current release not active | Installation and activation are outside this repository |
@@ -103,6 +104,8 @@ snapshot is unavailable.
   itself prove that the model server decoded requests in one batch.
 - A model constrained to JSON Schema can still produce semantically wrong
   values; client-side pydantic validation remains mandatory.
+- Usage for a cancelled model request can be incomplete because the server may
+  send usage only in the final stream chunk.
 - Moving or renaming a repository preserves the record but changes the
   workspace identity used by convenience lookups.
 
