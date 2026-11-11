@@ -189,9 +189,26 @@ DBOS workflow and records `client_disconnected` on the run.
 ## Cancellation
 
 The daemon cancels a workflow with `DBOS.cancel_workflow_async`. Only the model
-step is preemptible. DBOS then cancels the model task and closes its upstream
-stream. Tool steps stay non-preemptible so their side-effect records remain
-complete.
+request and model stream steps are preemptible. DBOS then cancels the model task
+and closes its upstream stream. The event, tool, and capability steps are not
+preemptible. The code sets `preemptible` only in the `model` step configuration.
+
+A `Coder` tool does not run as a DBOS step. pydantic-ai wraps only MCP and
+dynamic toolsets, so a `Coder` function tool runs inline in the workflow
+coroutine. A cancel does not stop it. The harness records the start and the end
+of each tool call as DBOS steps (`record_tool_effect`, `finish_tool_effect`).
+DBOS refuses to start a step in a cancelled workflow.
+
+When a cancel arrives during a `Coder` tool call:
+
+- The tool runs to its end. It can still change the workspace.
+- The daemon writes the run row `cancelled` as soon as DBOS accepts the cancel.
+  It does not wait for the tool.
+- `finish_tool_effect` raises, so the effect record stays `started`.
+  `agentman status` lists it as an unresolved effect.
+- The final turn frame arrives after the tool returns.
+
+The roadmap lists the open work for this case.
 
 When the cancelled workflow unwinds, the runtime records usage and metadata
 directly through the product store. It cannot use another DBOS step after
