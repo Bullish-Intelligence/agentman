@@ -70,3 +70,31 @@ def test_stream_turns_maps_terminal_error_frame_to_finding() -> None:
     assert outcome.response is None
     assert isinstance(outcome.error, TurnStreamError)
     assert str(outcome.error) == "turn failed; inspect the durable run record"
+
+
+def test_capabilities_reads_cancel_support_from_health() -> None:
+    class FakeClient(Client):
+        async def _get(self, path: str, params: dict[str, str] | None = None) -> object:
+            assert path == "/v1/health"
+            assert params is None
+            return {"status": "ok", "capabilities": ["cancel", 2]}
+
+    client = FakeClient.__new__(FakeClient)
+
+    assert asyncio.run(client.capabilities()) == ["cancel"]
+
+
+def test_cancel_run_posts_workspace_and_parses_response() -> None:
+    class FakeClient(Client):
+        async def _post(self, path: str, payload: object) -> object:
+            assert path == "/v1/runs/run-1/cancel"
+            assert payload == {"workspace": "/repo"}
+            return {"run_id": "run-1", "status": "cancelled", "cancelled": True}
+
+    client = FakeClient.__new__(FakeClient)
+
+    response = asyncio.run(client.cancel_run("run-1", workspace="/repo"))
+
+    assert response.run_id == "run-1"
+    assert response.status == "cancelled"
+    assert response.cancelled

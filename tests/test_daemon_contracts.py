@@ -512,3 +512,113 @@ def test_turn_handler_sends_turn_error_with_the_cancel_reason(monkeypatch: pytes
     assert '"reason":"cancel_requested"' in frames[0]
     assert '"run_id":"run-1"' in frames[0]
     assert '"final":true' in frames[0]
+
+
+def test_health_lists_cancel_capability() -> None:
+    app = _app()
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._route("GET", "/v1/health", {}, b"", _wait_forever_receive, send)
+
+    asyncio.run(exercise())
+    payload = json.loads(sent[-1]["body"])
+    assert payload["capabilities"] == ["cancel"]
+
+
+@pytest.mark.parametrize(
+    ("run_id", "workspace", "expected_status", "expected_message"),
+    [
+        ("missing", "/repo", 404, "no run"),
+        ("run-1", "/other", 409, "different workspace"),
+    ],
+)
+def test_cancel_route_refuses_unknown_runs_and_other_workspaces(
+    run_id: str,
+    workspace: str,
+    expected_status: int,
+    expected_message: str,
+) -> None:
+    app = _app()
+    app.store = cast(Any, _CancelStore(_run("/repo")))
+
+    async def exercise() -> None:
+        async def send(_: Any) -> None:
+            raise AssertionError("a refused cancel must not send a response")
+
+        with pytest.raises(_HttpError, match=expected_message) as error:
+            await app._route(
+                "POST",
+                f"/v1/runs/{run_id}/cancel",
+                {},
+                json.dumps({"workspace": workspace}).encode(),
+                _wait_forever_receive,
+                send,
+            )
+        assert error.value.status == expected_status
+
+    asyncio.run(exercise())
+
+
+def test_cancel_route_returns_false_for_a_terminal_run() -> None:
+    app = _app()
+    app.store = cast(Any, _CancelStore(_run("/repo", status="completed")))
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._route(
+            "POST",
+            "/v1/runs/run-1/cancel",
+            {},
+            b'{"workspace":"/repo"}',
+            _wait_forever_receive,
+            send,
+        )
+
+    asyncio.run(exercise())
+    assert json.loads(sent[-1]["body"]) == {"run_id": "run-1", "status": "completed", "cancelled": False}
+
+
+def test_cancel_route_marks_a_running_run_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    store = _CancelStore(_run("/repo"))
+    app.store = cast(Any, store)
+    app.step_store = cast(Any, _EmptyStepStore())
+    cancelled: list[str] = []
+
+    class _DBOS:
+        @staticmethod
+        async def cancel_workflow_async(run_id: str) -> None:
+            cancelled.append(run_id)
+
+        @staticmethod
+        async def get_workflow_status_async(run_id: str) -> SimpleNamespace:
+            return SimpleNamespace(status="CANCELLED")
+
+    monkeypatch.setattr(daemon, "DBOS", _DBOS)
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._route(
+            "POST",
+            "/v1/runs/run-1/cancel",
+            {},
+            b'{"workspace":"/repo"}',
+            _wait_forever_receive,
+            send,
+        )
+
+    asyncio.run(exercise())
+    assert cancelled == ["run-1"]
+    assert store.run.status == "cancelled"
+    assert store.run.error is not None and store.run.error["reason"] == "cancel_requested"
+    assert json.loads(sent[-1]["body"]) == {"run_id": "run-1", "status": "cancelled", "cancelled": True}

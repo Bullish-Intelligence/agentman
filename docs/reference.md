@@ -18,6 +18,7 @@ one, it is the resolved current directory.
 | `agentman show [THREAD]` | Render a thread as Markdown; omitted means current |
 | `agentman status` | Show current thread/run state and unresolved effects |
 | `agentman resume RUN_ID [--yes]` | Inspect, confirm, and resume a DBOS workflow |
+| `agentman cancel [RUN_ID] [--thread NAME] [--all-running]` | Cancel one or more running turns |
 | `agentman config` | Print resolved values and their sources |
 | `agentman send MESSAGE` | Run one turn |
 | `agentman pipe [PREAMBLE]` | Read one turn from stdin |
@@ -43,6 +44,7 @@ allows one initial request and no transport retry. The option applies only to
 | `show` | `[THREAD]` | With no argument, renders the current thread. With an argument, resolves it as a thread name, not an arbitrary id. |
 | `status` | none | Reads the local current-thread pointer and prints status. With no pointer it prints `no current thread` and exits successfully. |
 | `resume` | `RUN_ID [--yes]` | Fetches the run, verifies its workspace, prints status, optionally confirms, and delegates resumption to DBOS. |
+| `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running runs in the named thread. `--all-running` selects running runs in every workspace thread. |
 | `config` | none | Prints resolved values and provenance, including inferference's resolved router URL when applicable. |
 | `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. |
 | `pipe` | `[PREAMBLE] [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json] [--each]` | Reads all stdin. Without `--each`, stdin is one turn; with it, each physical line is an independent ordinary run. |
@@ -77,12 +79,16 @@ input is reported by its one-based input index. Text output is prefixed with
 | --- | --- |
 | Unknown command, unknown option, multiple preambles, repeated `-j`, or a non-positive job count | Error on stderr, exit code `3` |
 | `-j`/ `--jobs` without `--each` | Error on stderr, exit code `3` |
+| `cancel` has no selector or more than one selector | Error on stderr, exit code `3` |
 | Missing socket, invalid config/spec, schema-import failure, unavailable database/router, or daemon HTTP error | Error on stderr, exit code `2` |
+| Daemon health has no `cancel` capability | Error on stderr, exit code `2` |
 | `pipe --each` cannot discover parallelism for a non-inferference model without an explicit job count | Error on stderr, exit code `2` |
 | An explicit transport retry limit uses a non-inferference model | Error before the run starts, exit code `2` |
 | Final output fails client-side validation, the daemon reports `turn_error`, or the stream ends without a result | Error on stderr, exit code `1` |
 | Fan-out has one or more failed inputs | Successful outputs remain ordered and visible; failures name their input indexes; exit code is `1`, unless a configuration failure makes it `2` |
 | `status` has no current thread | Prints `no current thread`, exit code `0` |
+| `cancel --thread` or `cancel --all-running` finds no running run | Prints `no running run`, exit code `0` |
+| `cancel RUN_ID` finds a terminal run | Prints `not cancelled <run-id>: already <status>`, exit code `1` |
 
 ## `pipe --each`
 
@@ -202,7 +208,7 @@ fields. Upgrade the client and daemon together.
 
 | Method and path | Request | Response |
 | --- | --- | --- |
-| `GET /v1/health` | none | status, package version, and protocol version |
+| `GET /v1/health` | none | status, package version, protocol version, and capabilities |
 | `POST /v1/turns` | `TurnRequest` JSON | SSE `StreamEnvelope` frames and one final `turn_result` or `turn_error` frame |
 | `POST /v1/threads` | workspace and optional name | `ThreadInfo` |
 | `GET /v1/threads?workspace=...` | query parameter | `ThreadList` |
@@ -211,6 +217,7 @@ fields. Upgrade the client and daemon together.
 | `GET /v1/runs/<id>` | path id | `RunInfo` |
 | `POST /v1/status` | workspace plus thread id or name | `StatusView` |
 | `POST /v1/resume` | workspace and run id | `ResumeResponse` |
+| `POST /v1/runs/<id>/cancel` | workspace | `CancelResponse` |
 
 `RunInfo` carries the run status (`running`, `completed`, `failed`, or
 `cancelled`), the usage known so far, and `error`. `error` is null unless the
