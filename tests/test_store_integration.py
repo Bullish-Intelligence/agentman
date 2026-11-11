@@ -117,6 +117,61 @@ async def test_run_error_round_trips_through_store(engine: Any, clean: None) -> 
     assert fetched.error == error
 
 
+async def test_finish_run_writes_only_while_the_run_is_running(engine: Any, clean: None) -> None:
+    store = Store(engine)
+    created = await store.create_thread(workspace="/repo", name="t")
+    await store.create_run(
+        run_id="run-final",
+        thread_id=created.id,
+        workspace="/repo",
+        agent="reviewer",
+        model="openai:slow",
+        prompt="hello",
+    )
+    first = {"reason": "cancel_requested", "type": None, "message": None}
+    second = {"reason": "workflow_cancelled", "type": None, "message": None}
+
+    assert await store.finish_run("run-final", status=RUN_CANCELLED, error=first, usage={"requests": 1})
+    assert not await store.finish_run("run-final", status=RUN_COMPLETED, output_json={"late": True})
+    assert not await store.finish_run("run-final", status=RUN_CANCELLED, error=second)
+    assert not await store.finish_run("run-absent", status=RUN_CANCELLED, error=second)
+
+    fetched = await store.get_run("run-final")
+    assert fetched is not None
+    assert fetched.status == RUN_CANCELLED
+    assert fetched.error == first
+    assert fetched.usage == {"requests": 1}
+    assert fetched.output_json is None
+
+
+async def test_finish_run_refuses_a_status_that_is_not_final(engine: Any, clean: None) -> None:
+    with pytest.raises(ValueError, match="final status"):
+        await Store(engine).finish_run("run-1", status="running")
+
+
+async def test_postgres_accepts_the_sanitized_text_of_a_hostile_error(engine: Any, clean: None) -> None:
+    from agentman.persistence.store import RUN_FAILED
+    from agentman.runtime import exception_error
+
+    store = Store(engine)
+    created = await store.create_thread(workspace="/repo", name="t")
+    await store.create_run(
+        run_id="run-hostile",
+        thread_id=created.id,
+        workspace="/repo",
+        agent="reviewer",
+        model="openai:slow",
+        prompt="hello",
+    )
+    error = exception_error(RuntimeError("nul\x00 and lone surrogate \ud800"))
+
+    assert await store.finish_run("run-hostile", status=RUN_FAILED, error=error)
+
+    fetched = await store.get_run("run-hostile")
+    assert fetched is not None and fetched.status == RUN_FAILED
+    assert fetched.error == error
+
+
 async def test_journal_lists_events_snapshots_and_unresolved_effects(engine: Any, clean: None) -> None:
     store = PostgresStepStore(engine)
     journal = Journal(engine)

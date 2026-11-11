@@ -76,8 +76,55 @@ nothing, because the server sends usage only in the last stream chunk.
 | `type` | The exception class name, or null |
 | `message` | The exception text, at most 4000 characters, or null |
 
+The runtime cleans the exception text before it stores it. Postgres JSONB
+rejects the NUL character and unpaired surrogates, and one rejected value fails
+the whole update. The runtime removes NUL and replaces each unpaired surrogate
+with `?`. If the full `failed` write still fails, the runtime writes the status
+alone, so the run does not stay `running`.
+
 `completed`, `failed`, and `cancelled` are terminal. `resume` refuses a
 terminal run.
+
+### Final status
+
+The first writer of a final status wins. A write to `completed`, `failed`, or
+`cancelled` changes the row only while the status is `running`. The check and
+the write are one SQL statement, so two writers cannot both succeed. The writer
+that loses keeps the row as it is. It never changes the status, the reason, the
+output, or the usage.
+
+These writers race:
+
+- the workflow, when it records `completed` or `failed`;
+- the workflow unwind, when DBOS cancels the workflow; and
+- `cancel` and a client disconnect, in the daemon.
+
+The races resolve as follows:
+
+- A cancel that arrives after `completed` leaves the run `completed`. The
+  unwind keeps the real usage and output, and it touches the thread, so the
+  thread `updated_at` still moves. `cancel` reports `cancelled: false` with
+  status `completed`. A stream that sees the cancellation re-reads the row and
+  sends `turn_result` from it, not `turn_error`.
+- If the unwind writes `cancelled` before the daemon does, the daemon keeps
+  that reason. `cancel` reports `cancelled: true`, because the run was
+  `running` when the request began and is `cancelled` at the end.
+- If two cancels run at once, the first writer sets the reason. Both report
+  `cancelled: true`.
+- A run that was already final when the request began reports
+  `cancelled: false` with its status.
+
+A disconnect cancels the DBOS workflow first. This needs no run row, because
+the workflow creates the row. The daemon records the row only if it exists. It
+logs every error on this path. The response has started, so the path never
+raises.
+
+If a failure write meets a cancelled workflow, the runtime records the run as
+`cancelled` with reason `workflow_cancelled`. It keeps the original error type
+and message, and raises the cancellation again so DBOS sees a cancelled
+workflow. If parallel tool tasks all raise a DBOS cancellation, pydantic-ai
+joins them into one exception group. The runtime treats a group whose leaves
+are all DBOS cancellations as one cancellation.
 
 The DBOS model step stores captured stream events with DBOS serialization.
 Agentman JSON-round-trips those events before they cross the step boundary.
@@ -192,12 +239,19 @@ The recovery path has a deliberately small policy boundary:
 
 1. Verify that the run id is an agentman run.
 2. Verify that the request workspace matches the workspace stored on the run.
-3. Refuse terminal runs: `completed`, `failed`, and `cancelled`.
-4. Refuse a missing workspace.
-5. Ask harness recovery inspection for unresolved effects.
-6. Reconcile known file evidence against the current pre/post image.
-7. Refuse absent, malformed, out-of-workspace, or inconclusive evidence.
-8. Hand the canonical run id to `DBOS.resume_workflow_async`.
+3. Read the DBOS workflow status. If DBOS cancelled the workflow but the row
+   says `running`, a crash fell between the DBOS cancel and the row write.
+   Record the row as `cancelled` with reason `workflow_cancelled`, and refuse.
+   DBOS itself would restart a cancelled workflow.
+4. Refuse terminal runs: `completed`, `failed`, and `cancelled`.
+5. Refuse a missing workspace.
+6. Ask harness recovery inspection for unresolved effects.
+7. Reconcile known file evidence against the current pre/post image.
+8. Refuse absent, malformed, out-of-workspace, or inconclusive evidence.
+9. Hand the canonical run id to `DBOS.resume_workflow_async`.
+
+A cancel that arrives while the daemon waits for the resumed workflow returns
+HTTP 409.
 
 DBOS owns workflow resumption. Harness owns journal inspection. agentman owns
 the policy that decides whether the recorded facts authorize resumption. The

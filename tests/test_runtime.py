@@ -562,6 +562,9 @@ async def test_a_failed_failure_record_does_not_replace_the_original_error() -> 
         async def update_run(self, run_id: str, **fields: object) -> None:
             raise RuntimeError("the product store is down")
 
+        async def finish_run(self, run_id: str, **fields: object) -> bool:
+            raise RuntimeError("the product store is down")
+
     mock = MockOpenAI(content="not json at all")
     product = BrokenUpdateStore()
     thread = await product.create_thread(workspace="/repo", name="t")
@@ -605,3 +608,214 @@ async def test_the_journal_run_id_is_the_id_agentman_minted() -> None:
     assert record.run_id == "run-canonical"
     assert not record.run_id.startswith("sp-"), "the harness derived its own id; the override broke"
     assert record.agent_name == "summary", "the agent name must survive on the journal record"
+
+
+# -- cancellation and final-status rules ---------------------------------------
+
+
+def _cancel_model(raised: BaseException):
+    from pydantic_ai.messages import ModelMessage, ModelResponse
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    async def fail(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise raised
+
+    return FunctionModel(fail, model_name="cancelled")
+
+
+async def test_error_text_drops_nul_and_replaces_lone_surrogates() -> None:
+    from agentman.runtime import exception_error, workflow_cancelled_error
+
+    error = RuntimeError("bad\x00 text \ud800 end")
+    for value in (exception_error(error), workflow_cancelled_error(error)):
+        assert value["message"] == "bad text ? end"
+        # Postgres JSONB accepts only text that is valid UTF-8 without NUL.
+        json.dumps(value).encode("utf-8")
+        assert "\\u0000" not in json.dumps(value)
+
+
+async def test_failed_run_with_bad_error_text_is_still_recorded_as_failed() -> None:
+    """A rejected ``error`` value must not leave the run ``running``."""
+
+    class RejectingStore(FakeProductStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finish_calls: list[dict[str, Any]] = []
+
+        async def finish_run(self, run_id: str, **fields: Any) -> bool:
+            self.finish_calls.append(dict(fields))
+            if "error" in fields:
+                raise RuntimeError("unsupported Unicode escape sequence")
+            return await super().finish_run(run_id, **fields)
+
+    product = RejectingStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+
+    import pytest
+
+    with pytest.raises(Exception):  # noqa: B017 - the type is pydantic-ai's concern
+        await run_turn(
+            _turn(thread.id),
+            step_store=InMemoryStepStore(),
+            product_store=product,
+            run_id="run-1",
+            model=build_mock_model(MockOpenAI(content="not json at all")),
+        )
+    run = await product.get_run("run-1")
+    assert run is not None and run.status == "failed"
+    assert [sorted(call) for call in product.finish_calls][-1] == ["status"]
+
+
+async def test_failure_record_that_meets_a_cancel_records_cancelled_and_raises_the_cancel(monkeypatch) -> None:
+    import pytest
+    from dbos._error import DBOSWorkflowCancelledError
+
+    import agentman.runtime as runtime
+
+    async def cancelled_step(*args: Any, **kwargs: Any) -> None:
+        raise DBOSWorkflowCancelledError("cancelled by DBOS")
+
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    monkeypatch.setattr(runtime, "_update_run_step", cancelled_step)
+
+    with pytest.raises(DBOSWorkflowCancelledError):
+        await run_turn(
+            _turn(thread.id),
+            step_store=InMemoryStepStore(),
+            product_store=product,
+            run_id="run-1",
+            model=build_mock_model(MockOpenAI(content="not json at all")),
+        )
+    run = await product.get_run("run-1")
+    assert run is not None and run.status == "cancelled"
+    assert run.error == {
+        "reason": "workflow_cancelled",
+        "type": "UnexpectedModelBehavior",
+        "message": "Exceeded maximum output retries (1)",
+    }
+    assert run.usage is not None and run.usage["requests"] == 2
+
+
+async def test_a_cancel_after_the_completed_write_keeps_the_result_and_touches_the_thread(monkeypatch) -> None:
+    import pytest
+    from dbos._error import DBOSWorkflowCancelledError
+
+    import agentman.runtime as runtime
+
+    async def cancelled_touch(*args: Any, **kwargs: Any) -> None:
+        raise DBOSWorkflowCancelledError("cancelled by DBOS")
+
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    monkeypatch.setattr(runtime, "_touch_thread_step", cancelled_touch)
+
+    with pytest.raises(DBOSWorkflowCancelledError):
+        await run_turn(
+            _turn(thread.id),
+            step_store=InMemoryStepStore(),
+            product_store=product,
+            run_id="run-1",
+            model=build_mock_model(MockOpenAI(content=json.dumps({"title": "t", "rating": 3}))),
+        )
+    run = await product.get_run("run-1")
+    assert run is not None and run.status == "completed"
+    assert run.output_json == {"title": "t", "rating": 3}
+    assert run.error is None
+    assert run.usage is not None and run.usage["requests"] == 1
+    touched = product.threads[thread.id]
+    assert touched.updated_at > thread.updated_at, "the unwind must touch the thread"
+
+
+async def test_the_unwind_keeps_the_reason_of_a_run_another_writer_cancelled() -> None:
+    import pytest
+    from dbos._error import DBOSWorkflowCancelledError
+    from pydantic_ai.models.function import FunctionModel
+
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+
+    async def cancel_model(messages: object, info: object) -> object:
+        # The cancel request writes first, as the daemon does.
+        won = await product.finish_run("run-1", status="cancelled", error={"reason": "cancel_requested"}, usage=None)
+        assert won
+        raise DBOSWorkflowCancelledError("cancelled by DBOS")
+
+    with pytest.raises(DBOSWorkflowCancelledError):
+        await run_turn(
+            _turn(thread.id),
+            step_store=InMemoryStepStore(),
+            product_store=product,
+            run_id="run-1",
+            model=FunctionModel(cancel_model, model_name="cancelled"),  # type: ignore[arg-type]
+        )
+    run = await product.get_run("run-1")
+    assert run is not None and run.status == "cancelled"
+    assert run.error is not None and run.error["reason"] == "cancel_requested"
+    assert run.usage is not None, "the unwind adds the usage the first writer did not know"
+    assert run.run_metadata["logical_turn_count"] == 1
+
+
+async def test_record_cancel_never_rewrites_a_completed_or_failed_run() -> None:
+    from agentman.runtime import _record_cancel
+
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    for run_id, status in (("done", "completed"), ("broken", "failed")):
+        await product.create_run(
+            run_id=run_id, thread_id=thread.id, workspace="/repo", agent="a", model="m", prompt="p"
+        )
+        await product.finish_run(run_id, status=status, usage={"requests": 5}, run_metadata={"kept": True})
+        await _record_cancel(
+            product, run_id, metadata={"kept": False}, usage={"requests": 0}, error={"reason": "workflow_cancelled"}
+        )
+        run = await product.get_run(run_id)
+        assert run is not None and run.status == status
+        assert run.usage == {"requests": 5} and run.run_metadata == {"kept": True}
+        assert run.error is None
+
+
+async def test_a_group_of_cancellations_is_one_cancellation() -> None:
+    import pytest
+    from dbos._error import DBOSWorkflowCancelledError
+
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    group = BaseExceptionGroup(
+        "tools",
+        [DBOSWorkflowCancelledError("first"), BaseExceptionGroup("inner", [DBOSWorkflowCancelledError("second")])],
+    )
+
+    with pytest.raises(DBOSWorkflowCancelledError, match="first") as caught:
+        await run_turn(
+            _turn(thread.id),
+            step_store=InMemoryStepStore(),
+            product_store=product,
+            run_id="run-1",
+            model=_cancel_model(group),
+        )
+    assert caught.value.__cause__ is group
+    run = await product.get_run("run-1")
+    assert run is not None and run.status == "cancelled"
+    assert run.error is not None and run.error["reason"] == "workflow_cancelled"
+
+
+async def test_a_mixed_group_is_not_treated_as_a_cancellation() -> None:
+    import pytest
+    from dbos._error import DBOSWorkflowCancelledError
+
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    group = BaseExceptionGroup("tools", [DBOSWorkflowCancelledError("first"), KeyboardInterrupt()])
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await run_turn(
+            _turn(thread.id),
+            step_store=InMemoryStepStore(),
+            product_store=product,
+            run_id="run-1",
+            model=_cancel_model(group),
+        )
+    assert caught.value is group
+    run = await product.get_run("run-1")
+    assert run is not None and run.status == "running"

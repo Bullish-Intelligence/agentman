@@ -31,7 +31,7 @@ from agentman.model import ModelResolutionError, require_schema, resolve_capabil
 from agentman.persistence.engine import create_engine
 from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
-from agentman.persistence.store import RUN_CANCELLED, RUN_TERMINAL, Store
+from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_RUNNING, RUN_TERMINAL, Run, Store
 from agentman.protocol import (
     PROTOCOL_VERSION,
     CancelRequest,
@@ -320,13 +320,17 @@ class AgentmanApp:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if disconnect_task in done:
-                await self.cancel_run(run_id, workspace=request.workspace, reason="client_disconnected")
+                # The response already started. Nothing on this path may raise.
+                accepted = await self._cancel_after_disconnect(run_id, workspace=request.workspace)
                 drain_task.cancel()
                 await asyncio.gather(drain_task, return_exceptions=True)
-                try:
-                    await result_task
-                except DBOSAwaitedWorkflowCancelledError:
-                    pass
+                if accepted:
+                    try:
+                        await result_task
+                    except DBOSAwaitedWorkflowCancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("run %s ended with an error after the client disconnected", run_id)
                 return
 
             disconnect_task.cancel()
@@ -334,21 +338,27 @@ class AgentmanApp:
             try:
                 result = result_task.result()
             except DBOSAwaitedWorkflowCancelledError:
-                run = await store.get_run(run_id)
-                reason = run.error.get("reason") if run is not None and run.error is not None else "workflow_cancelled"
+                run = await self._read_run_after_cancel(run_id)
                 self.registry.publish(run_id, None)
                 await drain_task
-                await _send_sse(
-                    send,
-                    StreamEnvelope(
-                        run_id=run_id,
-                        request_ordinal=-1,
-                        event_ordinal=-1,
-                        kind="turn_error",
-                        event={"error": "turn cancelled", "reason": reason, "run_id": run_id},
-                        final=True,
-                    ),
-                )
+                if run is not None and run.status == RUN_COMPLETED:
+                    # The turn finished before the cancel took effect. The row is the result.
+                    await _send_sse(send, _result_frame(run))
+                else:
+                    reason = (
+                        run.error.get("reason") if run is not None and run.error is not None else "workflow_cancelled"
+                    )
+                    await _send_sse(
+                        send,
+                        StreamEnvelope(
+                            run_id=run_id,
+                            request_ordinal=-1,
+                            event_ordinal=-1,
+                            kind="turn_error",
+                            event={"error": "turn cancelled", "reason": reason, "run_id": run_id},
+                            final=True,
+                        ),
+                    )
             except Exception:
                 self.registry.publish(run_id, None)
                 await drain_task
@@ -392,7 +402,14 @@ class AgentmanApp:
             self.registry.unsubscribe(run_id, queue)
 
     async def cancel_run(self, run_id: str, *, workspace: str, reason: str) -> dict[str, Any]:
-        """Cancel a workflow and record the run state after DBOS accepts it."""
+        """Cancel a workflow and record the run state after DBOS accepts it.
+
+        The first writer of a final status wins and sets the reason. Return
+        ``cancelled: true`` when the run was ``running`` at the start of the
+        request and is ``cancelled`` at the end, even if the workflow unwind
+        wrote the status first. Otherwise return ``cancelled: false`` with the
+        current status.
+        """
         store = self._store()
         run = await store.get_run(run_id)
         if run is None:
@@ -406,18 +423,10 @@ class AgentmanApp:
         workflow_status = await DBOS.get_workflow_status_async(run_id)
         status = workflow_status.status if workflow_status is not None else None
         if status == "CANCELLED":
-            latest = await store.get_run(run_id)
-            if latest is not None and latest.status in RUN_TERMINAL:
-                return {"run_id": run_id, "status": latest.status, "cancelled": False}
-            usage = await usage_so_far(self.step_store, run_id) if self.step_store is not None else None
-            await store.update_run(
-                run_id,
-                status=RUN_CANCELLED,
-                usage=usage,
-                error=RunError(reason=reason).model_dump(mode="json"),
-            )
-            logger.info("cancelled run %s with reason %s", run_id, reason)
-            return {"run_id": run_id, "status": RUN_CANCELLED, "cancelled": True}
+            latest = await self._finish_cancelled(run_id, reason=reason)
+            if latest is not None and latest.status == RUN_CANCELLED:
+                return {"run_id": run_id, "status": RUN_CANCELLED, "cancelled": True}
+            return {"run_id": run_id, "status": latest.status if latest is not None else run.status, "cancelled": False}
         if status in {"SUCCESS", "ERROR"}:
             latest = await store.get_run(run_id)
             return {
@@ -426,6 +435,47 @@ class AgentmanApp:
                 "cancelled": False,
             }
         raise _HttpError(409, f"run {run_id!r} could not be cancelled")
+
+    async def _finish_cancelled(self, run_id: str, *, reason: str) -> Run | None:
+        """Write ``cancelled`` if the run is still ``running``; return the row after the write."""
+        store = self._store()
+        usage = await usage_so_far(self.step_store, run_id) if self.step_store is not None else None
+        won = await store.finish_run(
+            run_id,
+            status=RUN_CANCELLED,
+            usage=usage,
+            error=RunError(reason=reason).model_dump(mode="json"),
+        )
+        if won:
+            logger.info("cancelled run %s with reason %s", run_id, reason)
+        return await store.get_run(run_id)
+
+    async def _cancel_after_disconnect(self, run_id: str, *, workspace: str) -> bool:
+        """Cancel the workflow of a client that left. Never raise.
+
+        The run row may not exist yet: the workflow creates it. The DBOS cancel
+        needs no row, so it comes first. The function records the row only if
+        it exists. It returns ``True`` when DBOS accepted the cancel.
+        """
+        try:
+            await DBOS.cancel_workflow_async(run_id)
+        except Exception:
+            logger.exception("could not cancel run %s after the client disconnected", run_id)
+            return False
+        try:
+            run = await self._store().get_run(run_id)
+            if run is not None and run.workspace == workspace and run.status == RUN_RUNNING:
+                await self._finish_cancelled(run_id, reason="client_disconnected")
+        except Exception:
+            logger.exception("could not record run %s as cancelled after the client disconnected", run_id)
+        return True
+
+    async def _read_run_after_cancel(self, run_id: str) -> Run | None:
+        try:
+            return await self._store().get_run(run_id)
+        except Exception:
+            logger.exception("could not read run %s after the workflow was cancelled", run_id)
+            return None
 
     async def _resolve_turn_model(self, request: TurnRequest) -> tuple[str, str | None, int | None]:
         if not request.model.startswith(MODEL_PREFIX):
@@ -474,12 +524,30 @@ class AgentmanApp:
         if self.journal is None:
             raise _HttpError(503, "the daemon is not started")
         try:
+            await self._refuse_cancelled_workflow(run)
             await authorize_resume(store=self._store(), journal=self.journal, run_id=request.run_id)
             handle = await DBOS.resume_workflow_async(request.run_id)
             await handle.get_result()
         except ResumeRefused as error:
             raise _HttpError(409, str(error)) from error
+        except DBOSAwaitedWorkflowCancelledError as error:
+            raise _HttpError(409, f"run {request.run_id} was cancelled while it resumed") from error
         await _send_json(send, 200, ResumeResponse(run_id=request.run_id).model_dump(mode="json"))
+
+    async def _refuse_cancelled_workflow(self, run: Run) -> None:
+        """Refuse to resume a run that DBOS cancelled.
+
+        A crash can fall between the DBOS cancel and the row write. Then the row
+        says ``running`` while DBOS says ``CANCELLED``, and DBOS would restart
+        the workflow. This method repairs the row and refuses the resume.
+        """
+        if run.status in RUN_TERMINAL:
+            return
+        workflow_status = await DBOS.get_workflow_status_async(run.id)
+        if workflow_status is None or workflow_status.status != "CANCELLED":
+            return
+        await self._finish_cancelled(run.id, reason="workflow_cancelled")
+        raise ResumeRefused(f"cannot resume {run.id}: the workflow was cancelled")
 
     # -- helpers ---------------------------------------------------------------
 
@@ -498,6 +566,26 @@ class AgentmanApp:
             return await client.capabilities()
         finally:
             await client.aclose()
+
+
+def _result_frame(run: Run) -> StreamEnvelope:
+    """Build the final ``turn_result`` frame from a ``completed`` run row."""
+    return StreamEnvelope(
+        run_id=run.id,
+        request_ordinal=-1,
+        event_ordinal=-1,
+        kind="turn_result",
+        event=TurnResponse(
+            run_id=run.id,
+            thread_id=run.thread_id,
+            output=run.output_json,
+            output_type=run.output_type,
+            messages=run.messages_json or [],
+            usage=run.usage,
+            run_metadata=run.run_metadata,
+        ).model_dump(mode="json"),
+        final=True,
+    )
 
 
 async def _drain(queue: asyncio.Queue[StreamEnvelope | None], send: Any) -> None:

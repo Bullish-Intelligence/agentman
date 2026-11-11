@@ -45,7 +45,7 @@ from agentman.model import (
     build_model,
 )
 from agentman.model import PREFIX as MODEL_PREFIX
-from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_FAILED, RUN_RUNNING
+from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_FAILED, RUN_TERMINAL
 from agentman.protocol import RunError, RunMetadata
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,8 @@ class ProductStore(Protocol):
     ) -> Any: ...  # pragma: no cover
 
     async def update_run(self, run_id: str, **fields: Any) -> None: ...  # pragma: no cover
+
+    async def finish_run(self, run_id: str, **fields: Any) -> bool: ...  # pragma: no cover
 
     async def get_run(self, run_id: str) -> Any | None: ...  # pragma: no cover
 
@@ -281,8 +283,15 @@ async def _create_run_step(
 
 @DBOS.step(name="agentman.update_run")
 async def _update_run_step(product_store: ProductStore, run_id: str, fields: dict[str, Any]) -> None:
-    """Update the product run row exactly once, even across recovery."""
-    await product_store.update_run(run_id, **fields)
+    """Update the product run row exactly once, even across recovery.
+
+    A write to a final status is conditional: it changes the row only while the
+    run is ``running``. The first writer of a final status wins.
+    """
+    if fields.get("status") in RUN_TERMINAL:
+        await product_store.finish_run(run_id, **fields)
+    else:
+        await product_store.update_run(run_id, **fields)
 
 
 @DBOS.step(name="agentman.touch_thread")
@@ -306,12 +315,24 @@ ERROR_MESSAGE_LIMIT = 4000
 """The longest exception text a run row keeps, in characters."""
 
 
+def _error_text(error: BaseException) -> str:
+    """Return the message of ``error`` in a form Postgres JSONB accepts.
+
+    JSONB rejects the NUL character and unpaired surrogates. One rejected value
+    fails the whole update, so the run would stay ``running``. This function
+    removes NUL and replaces each unpaired surrogate with ``?``.
+    """
+    text = str(error).replace("\x00", "")
+    text = text.encode("utf-8", "replace").decode("utf-8")
+    return text[:ERROR_MESSAGE_LIMIT]
+
+
 def exception_error(error: BaseException) -> dict[str, Any]:
     """Return the ``run.error`` value for a run that ended with ``error``."""
     return RunError(
         reason="exception",
         type=type(error).__name__,
-        message=str(error)[:ERROR_MESSAGE_LIMIT],
+        message=_error_text(error),
     ).model_dump(mode="json")
 
 
@@ -320,7 +341,7 @@ def workflow_cancelled_error(error: BaseException) -> dict[str, Any]:
     return RunError(
         reason="workflow_cancelled",
         type=type(error).__name__,
-        message=str(error)[:ERROR_MESSAGE_LIMIT],
+        message=_error_text(error),
     ).model_dump(mode="json")
 
 
@@ -347,6 +368,47 @@ async def usage_so_far(step_store: StepStore, run_id: str) -> dict[str, Any] | N
     return _usage_dict(usage)
 
 
+async def _record_cancel(
+    product_store: ProductStore,
+    run_id: str,
+    *,
+    metadata: dict[str, Any],
+    usage: dict[str, Any] | None,
+    error: dict[str, Any],
+) -> None:
+    """Record ``cancelled`` after DBOS cancelled the workflow.
+
+    The write is outside a DBOS step, because a cancelled workflow cannot run
+    one. The write is conditional: the first writer of a final status wins.
+    When another writer won, this function keeps that status:
+
+    - A ``completed`` row keeps its usage and metadata. The cancel may have
+      stopped the workflow before it touched the thread, so this function
+      touches the thread.
+    - A ``cancelled`` row keeps its reason. This function adds the usage and
+      the metadata that the first writer did not know.
+    """
+    try:
+        won = await product_store.finish_run(
+            run_id,
+            status=RUN_CANCELLED,
+            usage=usage,
+            run_metadata=metadata,
+            error=error,
+        )
+        if won:
+            return
+        run = await product_store.get_run(run_id)
+        if run is None:
+            return
+        if run.status == RUN_COMPLETED:
+            await product_store.touch_thread(run.thread_id)
+        elif run.status == RUN_CANCELLED:
+            await product_store.update_run(run_id, usage=usage, run_metadata=metadata)
+    except Exception:
+        logger.exception("could not record run %s after DBOS cancellation", run_id)
+
+
 async def _record_failure(
     product_store: ProductStore,
     run_id: str,
@@ -362,6 +424,14 @@ async def _record_failure(
     exception, which is the failure F1 exists to prevent. So the failure to
     record is logged and swallowed; the original exception continues to
     propagate.
+
+    If the full write fails, the function writes the status alone. Then a bad
+    value in ``error`` cannot leave the run ``running``.
+
+    If DBOS cancelled the workflow, the recording step raises the cancellation.
+    The function then records ``cancelled`` with the original error type and
+    message, and raises the cancellation again, so DBOS sees a cancelled
+    workflow.
     """
     try:
         await _update_run_step(
@@ -369,8 +439,36 @@ async def _record_failure(
             run_id,
             {"status": RUN_FAILED, "run_metadata": run_metadata, "usage": usage, "error": error},
         )
+        return
+    except DBOSWorkflowCancelledError:
+        logger.warning("run %s failed after DBOS cancelled the workflow; recording it as cancelled", run_id)
+        await _record_cancel(
+            product_store,
+            run_id,
+            metadata=run_metadata,
+            usage=usage,
+            error={**error, "reason": "workflow_cancelled"},
+        )
+        raise
     except Exception:
         logger.exception("could not record run %s as failed", run_id)
+    try:
+        await _update_run_step(product_store, run_id, {"status": RUN_FAILED})
+    except DBOSWorkflowCancelledError:
+        raise
+    except Exception:
+        logger.exception("could not record the status of run %s as failed", run_id)
+
+
+def _cancel_leaf(group: BaseExceptionGroup[BaseException]) -> DBOSWorkflowCancelledError | None:
+    """Return one cancellation when every leaf of ``group`` is a DBOS cancellation."""
+    cancelled, rest = group.split(DBOSWorkflowCancelledError)
+    if cancelled is None or rest is not None:
+        return None
+    leaf: BaseException = cancelled
+    while isinstance(leaf, BaseExceptionGroup):
+        leaf = leaf.exceptions[0]
+    return leaf if isinstance(leaf, DBOSWorkflowCancelledError) else None
 
 
 async def run_turn(
@@ -451,21 +549,16 @@ async def run_turn(
             run_metadata=metadata,
         )
     except DBOSWorkflowCancelledError as error:
-        metadata = _run_metadata(
-            turn,
-            physical_model_request_count=request_counter.count if request_counter is not None else None,
+        await _record_cancel(
+            product_store,
+            run_id,
+            metadata=_run_metadata(
+                turn,
+                physical_model_request_count=request_counter.count if request_counter is not None else None,
+            ),
+            usage=await usage_so_far(step_store, run_id),
+            error=workflow_cancelled_error(error),
         )
-        fields: dict[str, Any] = {
-            "usage": await usage_so_far(step_store, run_id),
-            "run_metadata": metadata,
-        }
-        try:
-            run = await product_store.get_run(run_id)
-            if run is not None and run.status == RUN_RUNNING:
-                fields.update(status=RUN_CANCELLED, error=workflow_cancelled_error(error))
-            await product_store.update_run(run_id, **fields)
-        except Exception:
-            logger.exception("could not record run %s after DBOS cancellation", run_id)
         raise
     except Exception as error:
         metadata = _run_metadata(
@@ -480,6 +573,23 @@ async def run_turn(
             error=exception_error(error),
         )
         raise
+    except BaseExceptionGroup as group:
+        # pydantic-ai joins parallel tool tasks. Two cancellations at once reach
+        # this function as one group, not as one cancellation.
+        cancelled = _cancel_leaf(group)
+        if cancelled is None:
+            raise
+        await _record_cancel(
+            product_store,
+            run_id,
+            metadata=_run_metadata(
+                turn,
+                physical_model_request_count=request_counter.count if request_counter is not None else None,
+            ),
+            usage=await usage_so_far(step_store, run_id),
+            error=workflow_cancelled_error(cancelled),
+        )
+        raise DBOSWorkflowCancelledError(str(cancelled)) from group
 
 
 def _run_metadata(turn: Turn, *, physical_model_request_count: int | None) -> dict[str, Any]:
