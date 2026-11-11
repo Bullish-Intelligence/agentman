@@ -14,7 +14,7 @@ from pydantic_ai_harness.step_persistence import ToolEffectRecord
 from pydantic_ai_harness.step_persistence.recovery import RecoveryInspection
 
 from agentman.effects import ABSENT_FILE, UNKNOWN_IMAGE
-from agentman.persistence.store import RUN_COMPLETED, RUN_FAILED
+from agentman.persistence.store import RUN_TERMINAL
 
 
 class ResumeRefused(RuntimeError):
@@ -34,7 +34,7 @@ async def authorize_resume(*, store: _RunReader, journal: _RecoveryReader, run_i
     run = await store.get_run(run_id)
     if run is None:
         raise ResumeRefused(f"cannot resume {run_id}: not an agentman run")
-    if run.status in {RUN_COMPLETED, RUN_FAILED}:
+    if run.status in RUN_TERMINAL:
         raise ResumeRefused(f"cannot resume {run_id}: run is already terminal ({run.status})")
     workspace = Path(run.workspace)
     if not workspace.is_dir():

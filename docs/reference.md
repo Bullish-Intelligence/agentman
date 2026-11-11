@@ -212,6 +212,14 @@ fields. Upgrade the client and daemon together.
 | `POST /v1/status` | workspace plus thread id or name | `StatusView` |
 | `POST /v1/resume` | workspace and run id | `ResumeResponse` |
 
+`RunInfo` carries the run status (`running`, `completed`, `failed`, or
+`cancelled`), the usage known so far, and `error`. `error` is null unless the
+run ended without a result. Then it names the `reason` (`exception`,
+`cancel_requested`, `client_disconnected`, or `workflow_cancelled`) and the
+exception `type` and `message` when one exists. These two fields are additive
+within protocol 3. An older agentman client rejects them, so upgrade the client
+and daemon together.
+
 Turn history is not sent as a `messages` field. The daemon loads it by thread
 id from the journal. `TurnRequest.max_transport_retries` is optional and must
 be non-negative when present. SSE frames carry the protocol version, run id,

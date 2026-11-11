@@ -12,7 +12,7 @@ from sqlalchemy import delete
 from agentman.persistence.engine import create_engine
 from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
-from agentman.persistence.store import RUN_COMPLETED, Store, short_id
+from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, Store, short_id
 from agentman.persistence.tables import messages, run, runs, snapshot_idempotency_keys, snapshots, thread
 from agentman.status import compose_status
 
@@ -94,6 +94,27 @@ async def test_run_records_agent_and_model_per_run(engine: Any, clean: None) -> 
     }
     runs = await store.list_runs(thread_id=created.id)
     assert [record.id for record in runs] == ["run-1"]
+
+
+async def test_run_error_round_trips_through_store(engine: Any, clean: None) -> None:
+    store = Store(engine)
+    created = await store.create_thread(workspace="/repo", name="t")
+    await store.create_run(
+        run_id="run-cancelled",
+        thread_id=created.id,
+        workspace="/repo",
+        agent="reviewer",
+        model="openai:slow",
+        prompt="hello",
+    )
+    error = {"reason": "cancel_requested", "type": None, "message": None}
+
+    await store.update_run("run-cancelled", status=RUN_CANCELLED, error=error)
+
+    fetched = await store.get_run("run-cancelled")
+    assert fetched is not None
+    assert fetched.status == RUN_CANCELLED
+    assert fetched.error == error
 
 
 async def test_journal_lists_events_snapshots_and_unresolved_effects(engine: Any, clean: None) -> None:

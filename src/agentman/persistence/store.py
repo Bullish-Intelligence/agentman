@@ -22,6 +22,10 @@ from agentman.persistence.tables import thread as thread_table
 RUN_RUNNING = "running"
 RUN_COMPLETED = "completed"
 RUN_FAILED = "failed"
+RUN_CANCELLED = "cancelled"
+
+RUN_TERMINAL = frozenset({RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED})
+"""A run in one of these states never runs again."""
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,7 @@ class Run:
     created_at: datetime
     updated_at: datetime
     run_metadata: dict[str, Any] = field(default_factory=dict)
+    error: dict[str, Any] | None = None
 
 
 def short_id(identifier: str) -> str:
@@ -228,13 +233,16 @@ def _run_from_row(row: Any) -> Run:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         run_metadata=row.get("run_metadata") or {},
+        error=row.get("error"),
     )
 
 
 __all__ = [
+    "RUN_CANCELLED",
     "RUN_COMPLETED",
     "RUN_FAILED",
     "RUN_RUNNING",
+    "RUN_TERMINAL",
     "Run",
     "Store",
     "Thread",
