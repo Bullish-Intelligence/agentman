@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 from queue import Empty
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -18,7 +19,10 @@ from dbos import DBOS, DBOSConfig
 from dbos._error import DBOSAwaitedWorkflowCancelledError
 from support.openai_transport import build_tcp_model
 from support.slow_upstream import SlowUpstream, UpstreamConnection
+from typer.testing import CliRunner
 
+import agentman.cli as cli
+from agentman.client import Client
 from agentman.config import Config, Value
 from agentman.daemon import build_app
 from agentman.persistence.engine import create_engine
@@ -369,6 +373,92 @@ async def _disconnect_cancels_run(
                 assert run.error is not None and run.error["reason"] == "client_disconnected"
                 assert connection.closed_at is not None
         finally:
+            await engine.dispose()
+            server.should_exit = True
+            await _join(thread, 10)
+            assert not thread.is_alive(), "the daemon did not stop"
+            runtime.reset_agent_cache()
+
+
+def test_cancel_command_cancels_a_streaming_run_through_the_socket(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(_cancel_command_cancels_stream(database_url, tmp_path, monkeypatch))
+
+
+async def _cancel_command_cancels_stream(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SlowUpstream() as upstream:
+        import agentman.runtime as runtime
+
+        model = build_tcp_model(port=int(upstream.base_url.rsplit(":", 1)[1].split("/", 1)[0]))
+        monkeypatch.setattr(runtime, "build_model", lambda *args, **kwargs: model)
+        runtime.reset_agent_cache()
+        workspace = "/repo/cancel-command"
+        socket_path = tmp_path / "agentman-cancel.sock"
+        config = Config(
+            agent=Value("live", "cli"),
+            model=Value(None, "cli"),
+            database_url=Value(database_url, "cli"),
+            socket=Value(str(socket_path), "cli"),
+            router_url=Value(None, "cli"),
+        )
+        app = build_app(config)
+        server = uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), log_level="warning"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        for _ in range(200):
+            if server.started:
+                break
+            await asyncio.sleep(0.025)
+        assert server.started, "the daemon did not start"
+
+        engine = create_engine(database_url)
+        store = Store(engine)
+        client = Client(socket_path)
+        try:
+            thread_info = await client.new_thread(workspace=workspace, name="cancel")
+            request = TurnRequest(
+                workspace=workspace,
+                thread_id=thread_info.id,
+                agent_spec={"instructions": "continue"},
+                agent_name="cancel-command-integration",
+                model="mock:model",
+                prompt="continue",
+            )
+            stream = client.stream_turn(request)
+            first = await asyncio.wait_for(anext(stream), timeout=5)
+            second = await asyncio.wait_for(anext(stream), timeout=5)
+            assert not first.final and not second.final
+            run_id = first.run_id
+            await upstream.wait_for_chunks(20, timeout=5)
+
+            monkeypatch.setattr(cli, "_context", lambda **_: SimpleNamespace(config=config, workspace=workspace))
+            result = await asyncio.to_thread(CliRunner().invoke, cli.app, ["cancel", run_id])
+            assert result.exit_code == 0, result.output
+            assert result.output.strip() == f"cancelled {run_id}"
+
+            final = None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                envelope = await asyncio.wait_for(anext(stream), timeout=deadline - time.monotonic())
+                if envelope.final:
+                    final = envelope
+                    break
+            assert final is not None and final.kind == "turn_error"
+            assert final.event == {"error": "turn cancelled", "reason": "cancel_requested", "run_id": run_id}
+            connection = await upstream.wait_for_closed(timeout=5)
+            run = await store.get_run(run_id)
+            assert run is not None and run.status == "cancelled"
+            assert run.error is not None and run.error["reason"] == "cancel_requested"
+            assert connection.closed_at is not None
+        finally:
+            await client.aclose()
             await engine.dispose()
             server.should_exit = True
             await _join(thread, 10)

@@ -17,6 +17,8 @@ import httpx
 
 from agentman.protocol import (
     PROTOCOL_VERSION,
+    CancelRequest,
+    CancelResponse,
     NewThreadRequest,
     ResumeRequest,
     ResumeResponse,
@@ -88,6 +90,15 @@ class Client:
             return False
         return response.status_code == httpx.codes.OK
 
+    async def capabilities(self) -> list[str]:
+        payload = await self._get("/v1/health")
+        if not isinstance(payload, dict):
+            return []
+        capabilities = payload.get("capabilities")
+        if not isinstance(capabilities, list):
+            return []
+        return [value for value in capabilities if isinstance(value, str)]
+
     async def new_thread(self, *, workspace: str, name: str | None = None) -> ThreadInfo:
         request = NewThreadRequest(workspace=workspace, name=name)
         payload = await self._post("/v1/threads", request.model_dump(mode="json"))
@@ -122,6 +133,13 @@ class Client:
             "/v1/resume", ResumeRequest(workspace=workspace, run_id=run_id).model_dump(mode="json")
         )
         return ResumeResponse.model_validate(payload)
+
+    async def cancel_run(self, run_id: str, *, workspace: str) -> CancelResponse:
+        payload = await self._post(
+            f"/v1/runs/{run_id}/cancel",
+            CancelRequest(workspace=workspace).model_dump(mode="json"),
+        )
+        return CancelResponse.model_validate(payload)
 
     # -- the turn --------------------------------------------------------------
 

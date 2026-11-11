@@ -232,3 +232,15 @@ unresolved effects whose current filesystem state cannot be reconciled with
 the recorded evidence. agentman delegates workflow resumption to DBOS and
 does not replay tools itself. Both the CLI preflight and the daemon verify that
 the request workspace matches the workspace stored on the run.
+
+## Stop a turn
+
+Cancel one run by id:
+
+```sh
+agentman cancel <run-id>
+```
+
+Use `--thread NAME` to cancel running turns in one named thread. Use
+`--all-running` to cancel every running turn in the current workspace. A
+client disconnect also cancels its running turn.

@@ -267,6 +267,55 @@ def resume(
 
 
 @app.command()
+def cancel(
+    run_id: str | None = typer.Argument(None),
+    thread_name: str | None = typer.Option(None, "--thread", help="Cancel running turns in this named thread."),
+    all_running: bool = typer.Option(False, "--all-running", help="Cancel every running turn in this workspace."),
+) -> None:
+    """Cancel one running turn or select running turns by thread."""
+    selectors = int(run_id is not None) + int(thread_name is not None) + int(all_running)
+    if selectors != 1:
+        _fail("provide exactly one of RUN_ID, --thread, or --all-running", EXIT_USAGE)
+
+    async def run() -> None:
+        context = _context()
+        async with _client(context) as client:
+            if "cancel" not in await client.capabilities():
+                _fail("the daemon does not support cancel; upgrade the daemon", EXIT_CONFIG)
+
+            selected: list[str]
+            if run_id is not None:
+                selected = [run_id]
+            elif thread_name is not None:
+                thread = await client.resolve_thread(workspace=context.workspace, name=thread_name)
+                view = await client.get_thread(thread.id)
+                selected = [item.id for item in view.runs if item.status == "running"]
+            else:
+                threads = await client.list_threads(workspace=context.workspace)
+                selected = []
+                for thread in threads:
+                    view = await client.get_thread(thread.id)
+                    selected.extend(item.id for item in view.runs if item.status == "running")
+
+            if not selected:
+                typer.echo("no running run")
+                return
+
+            finding = False
+            for selected_run_id in selected:
+                result = await client.cancel_run(selected_run_id, workspace=context.workspace)
+                if result.cancelled:
+                    typer.echo(f"cancelled {selected_run_id}")
+                else:
+                    typer.echo(f"not cancelled {selected_run_id}: already {result.status}")
+                    finding = True
+            if finding:
+                raise typer.Exit(EXIT_FINDING)
+
+    _call(run)
+
+
+@app.command()
 def config() -> None:
     """Print the resolved config and where each value came from."""
     try:

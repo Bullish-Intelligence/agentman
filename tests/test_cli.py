@@ -526,3 +526,196 @@ def test_status_prints_the_usage_and_end_reason_of_a_cancelled_run(capsys) -> No
     assert "run run-1  cancelled  topic  openai:slow" in output
     assert "usage requests 1  input tokens 120  output tokens 30" in output
     assert "ended cancel_requested\n" in output
+
+
+def test_cancel_accepts_a_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    calls: list[tuple[str, str]] = []
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return ["cancel"]
+
+        async def cancel_run(self, run_id: str, *, workspace: str) -> SimpleNamespace:
+            calls.append((run_id, workspace))
+            return SimpleNamespace(run_id=run_id, status="cancelled", cancelled=True)
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+
+    result = CliRunner().invoke(app, ["cancel", "run-1"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "cancelled run-1"
+    assert calls == [("run-1", "/repo")]
+
+
+def test_cancel_resolves_a_thread_and_only_cancels_running_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    calls: list[str] = []
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return ["cancel"]
+
+        async def resolve_thread(self, *, workspace: str, name: str) -> SimpleNamespace:
+            assert (workspace, name) == ("/repo", "review")
+            return SimpleNamespace(id="thread-1")
+
+        async def get_thread(self, thread_id: str) -> SimpleNamespace:
+            assert thread_id == "thread-1"
+            return SimpleNamespace(
+                runs=[
+                    SimpleNamespace(id="run-running", status="running"),
+                    SimpleNamespace(id="run-done", status="completed"),
+                ]
+            )
+
+        async def cancel_run(self, run_id: str, *, workspace: str) -> SimpleNamespace:
+            assert workspace == "/repo"
+            calls.append(run_id)
+            return SimpleNamespace(run_id=run_id, status="cancelled", cancelled=True)
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+
+    result = CliRunner().invoke(app, ["cancel", "--thread", "review"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "cancelled run-running"
+    assert calls == ["run-running"]
+
+
+def test_cancel_selects_running_runs_across_the_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+    calls: list[str] = []
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return ["cancel"]
+
+        async def list_threads(self, *, workspace: str) -> list[SimpleNamespace]:
+            assert workspace == "/repo"
+            return [SimpleNamespace(id="thread-1"), SimpleNamespace(id="thread-2")]
+
+        async def get_thread(self, thread_id: str) -> SimpleNamespace:
+            runs = {
+                "thread-1": [SimpleNamespace(id="run-1", status="running")],
+                "thread-2": [SimpleNamespace(id="run-2", status="failed")],
+            }
+            return SimpleNamespace(runs=runs[thread_id])
+
+        async def cancel_run(self, run_id: str, *, workspace: str) -> SimpleNamespace:
+            assert workspace == "/repo"
+            calls.append(run_id)
+            return SimpleNamespace(run_id=run_id, status="cancelled", cancelled=True)
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+
+    result = CliRunner().invoke(app, ["cancel", "--all-running"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "cancelled run-1"
+    assert calls == ["run-1"]
+
+
+def test_cancel_reports_when_no_run_is_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return ["cancel"]
+
+        async def list_threads(self, *, workspace: str) -> list[SimpleNamespace]:
+            return [SimpleNamespace(id="thread-1")]
+
+        async def get_thread(self, thread_id: str) -> SimpleNamespace:
+            return SimpleNamespace(runs=[SimpleNamespace(id="run-1", status="completed")])
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+
+    result = CliRunner().invoke(app, ["cancel", "--all-running"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "no running run"
+
+
+def test_cancel_reports_an_already_ended_named_run_as_a_finding(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return ["cancel"]
+
+        async def cancel_run(self, run_id: str, *, workspace: str) -> SimpleNamespace:
+            return SimpleNamespace(run_id=run_id, status="completed", cancelled=False)
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+
+    result = CliRunner().invoke(app, ["cancel", "run-1"])
+
+    assert result.exit_code == cli.EXIT_FINDING, result.output
+    assert result.output.strip() == "not cancelled run-1: already completed"
+
+
+def test_cancel_refuses_an_old_daemon_without_the_capability(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, _ = _fanout_test_setup()
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def capabilities(self) -> list[str]:
+            return []
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+
+    result = CliRunner().invoke(app, ["cancel", "run-1"])
+
+    assert result.exit_code == cli.EXIT_CONFIG, result.output
+    assert "daemon does not support cancel" in result.output
+
+
+@pytest.mark.parametrize("arguments", [[], ["run-1", "--all-running"]])
+def test_cancel_requires_exactly_one_selector(arguments: list[str]) -> None:
+    result = CliRunner().invoke(app, ["cancel", *arguments])
+
+    assert result.exit_code == cli.EXIT_USAGE, result.output
+    assert "exactly one" in result.output

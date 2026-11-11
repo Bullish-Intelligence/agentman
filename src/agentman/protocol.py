@@ -150,6 +150,16 @@ class ResumeResponse(_Model):
     run_id: str
 
 
+class CancelRequest(_Model):
+    workspace: str
+
+
+class CancelResponse(_Model):
+    run_id: str
+    status: str
+    cancelled: bool
+
+
 class UnresolvedEffect(_Model):
     run_id: str
     tool_call_id: str
@@ -177,6 +187,8 @@ class ErrorResponse(_Model):
 __all__ = [
     "PROTOCOL_VERSION",
     "ErrorResponse",
+    "CancelRequest",
+    "CancelResponse",
     "NewThreadRequest",
     "RunInfo",
     "RunMetadata",

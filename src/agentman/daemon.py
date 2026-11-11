@@ -34,6 +34,8 @@ from agentman.persistence.step_store import PostgresStepStore
 from agentman.persistence.store import RUN_CANCELLED, RUN_TERMINAL, Store
 from agentman.protocol import (
     PROTOCOL_VERSION,
+    CancelRequest,
+    CancelResponse,
     ErrorResponse,
     NewThreadRequest,
     ResumeRequest,
@@ -206,7 +208,11 @@ class AgentmanApp:
 
     async def _route(self, method: str, path: str, query: dict[str, str], body: bytes, receive: Any, send: Any) -> None:
         if method == "GET" and path == "/v1/health":
-            await _send_json(send, 200, {"status": "ok", "version": __version__, "protocol": PROTOCOL_VERSION})
+            await _send_json(
+                send,
+                200,
+                {"status": "ok", "version": __version__, "protocol": PROTOCOL_VERSION, "capabilities": ["cancel"]},
+            )
             return
         if method == "POST" and path == "/v1/turns":
             await self._handle_turn(body, receive, send)
@@ -253,6 +259,16 @@ class AgentmanApp:
             if run is None:
                 raise _HttpError(404, f"no run {run_id!r}")
             await _send_json(send, 200, run_info(run).model_dump(mode="json"))
+            return
+        cancel_prefix = "/v1/runs/"
+        cancel_suffix = "/cancel"
+        if method == "POST" and path.startswith(cancel_prefix) and path.endswith(cancel_suffix):
+            run_id = path[len(cancel_prefix) : -len(cancel_suffix)]
+            if not run_id or "/" in run_id:
+                raise _HttpError(404, f"no route for {method} {path}")
+            request = CancelRequest.model_validate_json(body)
+            result = await self.cancel_run(run_id, workspace=request.workspace, reason="cancel_requested")
+            await _send_json(send, 200, CancelResponse.model_validate(result).model_dump(mode="json"))
             return
         if method == "POST" and path == "/v1/status":
             await self._handle_status(body, send)
