@@ -493,3 +493,36 @@ def test_pipe_each_keeps_successes_and_reports_indexed_validation_and_stream_fai
 
 async def _async_value(value: str) -> str:
     return value
+
+
+def test_status_prints_the_usage_and_end_reason_of_a_cancelled_run(capsys) -> None:
+    from datetime import UTC, datetime
+
+    from agentman.protocol import RunError, RunInfo, StatusView, ThreadInfo
+
+    now = datetime.now(UTC)
+    view = StatusView(
+        thread=ThreadInfo(
+            id="t" * 32, workspace="/repo", name="topic", created_at=now, updated_at=now, short_id="tttttttt"
+        ),
+        latest_run=RunInfo(
+            id="run-1",
+            thread_id="t" * 32,
+            workspace="/repo",
+            agent="topic",
+            model="openai:slow",
+            status="cancelled",
+            prompt="p",
+            usage={"requests": 1, "input_tokens": 120, "output_tokens": 30},
+            error=RunError(reason="cancel_requested"),
+            created_at=now,
+            updated_at=now,
+        ),
+    )
+
+    cli._print_status_view(view)
+
+    output = capsys.readouterr().out
+    assert "run run-1  cancelled  topic  openai:slow" in output
+    assert "usage requests 1  input tokens 120  output tokens 30" in output
+    assert "ended cancel_requested\n" in output

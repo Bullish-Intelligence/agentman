@@ -89,6 +89,8 @@ async def test_resume_allows_file_that_matches_post_image(tmp_path: Path) -> Non
     [
         (None, (), "not an agentman run"),
         (SimpleNamespace(workspace="/unused", status="completed"), (), "already terminal"),
+        (SimpleNamespace(workspace="/unused", status="failed"), (), "already terminal"),
+        (SimpleNamespace(workspace="/unused", status="cancelled"), (), r"already terminal \(cancelled\)"),
     ],
 )
 async def test_resume_refuses_invalid_run_facts(

@@ -19,6 +19,7 @@ from agentman.runtime import (
     load_history,
     reset_agent_cache,
     run_turn,
+    usage_so_far,
 )
 
 SCHEMA = {
@@ -408,6 +409,46 @@ async def test_failed_run_is_recorded_as_failed() -> None:
         )
     run = await product.get_run("run-1")
     assert run is not None and run.status == "failed"
+    assert run.error == {
+        "reason": "exception",
+        "type": "UnexpectedModelBehavior",
+        "message": "Exceeded maximum output retries (1)",
+    }
+    assert run.usage is not None and run.usage["requests"] == 2
+
+
+async def test_usage_so_far_counts_only_the_responses_of_its_own_run() -> None:
+    """A snapshot carries the thread history; earlier runs must not count."""
+    step_store = InMemoryStepStore()
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="t")
+    good = MockOpenAI(content=json.dumps({"title": "hello", "rating": 4}))
+    await run_turn(
+        _turn(thread.id, prompt="first"),
+        step_store=step_store,
+        product_store=product,
+        run_id="run-1",
+        model=build_mock_model(good),
+    )
+
+    import pytest
+
+    with pytest.raises(Exception):  # noqa: B017 - the type is pydantic-ai's concern
+        await run_turn(
+            _turn(thread.id, prompt="second"),
+            step_store=step_store,
+            product_store=product,
+            run_id="run-2",
+            model=build_mock_model(MockOpenAI(content="not json at all")),
+        )
+
+    first = await usage_so_far(step_store, "run-1")
+    second = await product.get_run("run-2")
+    assert first is not None and first["requests"] == 1
+    assert second is not None and second.usage is not None
+    assert second.usage["requests"] == 2
+    absent = await usage_so_far(step_store, "run-absent")
+    assert absent is not None and absent["requests"] == 0 and absent["output_tokens"] == 0
 
 
 async def test_agent_is_cached_per_spec_model_schema(monkeypatch) -> None:

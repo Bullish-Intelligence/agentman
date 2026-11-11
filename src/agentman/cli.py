@@ -671,6 +671,14 @@ def _print_status_view(view: Any) -> None:
     fallback = "enabled" if metadata.provider_fallback else "disabled"
     typer.echo(f"transport retries requested {requested}  effective {effective}  physical requests {physical}")
     typer.echo(f"provider fallback {fallback}")
+    if run.usage is not None:
+        requests = run.usage.get("requests", "unknown")
+        input_tokens = run.usage.get("input_tokens", "unknown")
+        output_tokens = run.usage.get("output_tokens", "unknown")
+        typer.echo(f"usage requests {requests}  input tokens {input_tokens}  output tokens {output_tokens}")
+    if run.error is not None:
+        detail = f"  {run.error.type}: {run.error.message}" if run.error.type is not None else ""
+        typer.echo(f"ended {run.error.reason}{detail}")
     typer.echo(f"events {view.events}  snapshots {view.snapshots}")
     typer.echo(f"messages {view.message_rows} rows  {view.message_bytes} bytes")
     for effect in view.unresolved_effects:

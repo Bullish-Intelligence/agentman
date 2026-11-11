@@ -13,7 +13,7 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from agentman.persistence.inspect import Journal
 from agentman.persistence.store import Run, Store, Thread
-from agentman.protocol import RunInfo, RunMetadata, StatusView, ThreadInfo, UnresolvedEffect
+from agentman.protocol import RunError, RunInfo, RunMetadata, StatusView, ThreadInfo, UnresolvedEffect
 
 
 async def thread_info(store: Store, thread: Thread) -> ThreadInfo:
@@ -41,6 +41,8 @@ def run_info(run: Run) -> RunInfo:
         output_json=run.output_json,
         output_type=run.output_type,
         run_metadata=RunMetadata.model_validate(run.run_metadata or {}),
+        usage=run.usage,
+        error=RunError.model_validate(run.error) if run.error is not None else None,
         created_at=run.created_at,
         updated_at=run.updated_at,
     )

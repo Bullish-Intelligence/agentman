@@ -45,6 +45,19 @@ class RunMetadata(_Model):
     physical_model_request_count: int | None = None
 
 
+class RunError(_Model):
+    """Why a run ended without a result.
+
+    ``reason`` is ``exception``, ``cancel_requested``,
+    ``client_disconnected``, or ``workflow_cancelled``. ``type`` and
+    ``message`` name the exception when one exists.
+    """
+
+    reason: str
+    type: str | None = None
+    message: str | None = None
+
+
 class TurnResponse(_Model):
     """The recorded outcome of one turn."""
 
@@ -110,6 +123,8 @@ class RunInfo(_Model):
     output_json: Any = None
     output_type: str | None = None
     run_metadata: RunMetadata = Field(default_factory=RunMetadata)
+    usage: dict[str, Any] | None = None
+    error: RunError | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -167,6 +182,7 @@ __all__ = [
     "RunMetadata",
     "ResumeRequest",
     "ResumeResponse",
+    "RunError",
     "StatusRequest",
     "StatusView",
     "StreamEnvelope",

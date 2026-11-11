@@ -51,16 +51,33 @@ Stores one turn’s product metadata:
 - thread and workspace;
 - agent and model labels;
 - prompt;
-- `running`, `completed`, or `failed` status;
+- `running`, `completed`, `failed`, or `cancelled` status;
 - output JSON and output type;
-- fallback `messages_json`; and
-- usage and timestamps; and
+- fallback `messages_json`;
+- usage and timestamps;
 - non-secret run metadata with requested and effective transport retry limits,
-  fallback state, logical turn count, and physical model request count.
+  fallback state, logical turn count, and physical model request count; and
+- `error`, the reason a run ended without a result.
 
 The product row is written through DBOS steps so recovery does not attempt a
 second plain insert for the same workflow id. A failure to record `failed` is
 logged without replacing the original turn exception.
+
+A `failed` or `cancelled` run has no pydantic-ai usage object. The runtime
+stores the usage known so far: the sum of the model responses of this run in
+the latest journal snapshot. A model request that did not complete adds
+nothing, because the server sends usage only in the last stream chunk.
+
+`error` is null for a running or completed run. Otherwise it holds:
+
+| Field | Value |
+| --- | --- |
+| `reason` | `exception`, `cancel_requested`, `client_disconnected`, or `workflow_cancelled` |
+| `type` | The exception class name, or null |
+| `message` | The exception text, at most 4000 characters, or null |
+
+`completed`, `failed`, and `cancelled` are terminal. `resume` refuses a
+terminal run.
 
 The DBOS model step stores captured stream events with DBOS serialization.
 Agentman JSON-round-trips those events before they cross the step boundary.
@@ -156,6 +173,7 @@ fourth harness lifecycle state and does not silently run the tool again.
 - the current workspace thread;
 - latest run metadata;
 - requested and effective transport retry limits and physical request count;
+- usage and the end reason of the latest run, when the row has them;
 - event and snapshot counts for the latest run;
 - message-row and byte statistics across the thread; and
 - unresolved effects across every run in the thread.
@@ -174,7 +192,7 @@ The recovery path has a deliberately small policy boundary:
 
 1. Verify that the run id is an agentman run.
 2. Verify that the request workspace matches the workspace stored on the run.
-3. Refuse terminal runs.
+3. Refuse terminal runs: `completed`, `failed`, and `cancelled`.
 4. Refuse a missing workspace.
 5. Ask harness recovery inspection for unresolved effects.
 6. Reconcile known file evidence against the current pre/post image.

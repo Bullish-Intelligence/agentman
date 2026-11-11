@@ -30,8 +30,9 @@ from dbos import DBOS
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.agent.abstract import EventStreamHandler
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
 from pydantic_ai.models import Model
+from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness.step_persistence import StepStore, continue_run
 
 from agentman.agent import build_agent, turn_capabilities
@@ -44,7 +45,7 @@ from agentman.model import (
 )
 from agentman.model import PREFIX as MODEL_PREFIX
 from agentman.persistence.store import RUN_COMPLETED, RUN_FAILED
-from agentman.protocol import RunMetadata
+from agentman.protocol import RunError, RunMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +301,50 @@ async def _load_history_step(
     return await load_history(step_store, product_store, thread_id, exclude_run_id=exclude_run_id)
 
 
-async def _record_failure(product_store: ProductStore, run_id: str, run_metadata: dict[str, Any]) -> None:
+ERROR_MESSAGE_LIMIT = 4000
+"""The longest exception text a run row keeps, in characters."""
+
+
+def exception_error(error: BaseException) -> dict[str, Any]:
+    """Return the ``run.error`` value for a run that ended with ``error``."""
+    return RunError(
+        reason="exception",
+        type=type(error).__name__,
+        message=str(error)[:ERROR_MESSAGE_LIMIT],
+    ).model_dump(mode="json")
+
+
+async def usage_so_far(step_store: StepStore, run_id: str) -> dict[str, Any] | None:
+    """Return the usage of the model responses the journal holds for ``run_id``.
+
+    A run that ends without a result has no pydantic-ai usage object. The
+    latest snapshot holds every response that completed, so the sum is the
+    usage known so far. A request that did not complete reports no usage: the
+    server sends usage only in the last stream chunk. The read is best effort
+    and returns ``None`` when the journal cannot be read.
+    """
+    try:
+        snapshot = await step_store.latest_snapshot(run_id=run_id, include_interrupted=True)
+    except Exception:
+        logger.exception("could not read the usage of run %s", run_id)
+        return None
+    usage = RunUsage()
+    if snapshot is not None:
+        for message in snapshot.messages:
+            if isinstance(message, ModelResponse) and message.run_id == run_id:
+                usage.requests += 1
+                usage.incr(message.usage)
+    return _usage_dict(usage)
+
+
+async def _record_failure(
+    product_store: ProductStore,
+    run_id: str,
+    run_metadata: dict[str, Any],
+    *,
+    usage: dict[str, Any] | None,
+    error: dict[str, Any],
+) -> None:
     """Record ``failed`` without ever replacing the error that caused it.
 
     The recording is a Postgres write, and Postgres is often the reason the turn
@@ -313,7 +357,7 @@ async def _record_failure(product_store: ProductStore, run_id: str, run_metadata
         await _update_run_step(
             product_store,
             run_id,
-            {"status": RUN_FAILED, "run_metadata": run_metadata},
+            {"status": RUN_FAILED, "run_metadata": run_metadata, "usage": usage, "error": error},
         )
     except Exception:
         logger.exception("could not record run %s as failed", run_id)
@@ -396,12 +440,18 @@ async def run_turn(
             usage=usage,
             run_metadata=metadata,
         )
-    except Exception:
+    except Exception as error:
         metadata = _run_metadata(
             turn,
             physical_model_request_count=request_counter.count if request_counter is not None else None,
         )
-        await _record_failure(product_store, run_id, metadata)
+        await _record_failure(
+            product_store,
+            run_id,
+            metadata,
+            usage=await usage_so_far(step_store, run_id),
+            error=exception_error(error),
+        )
         raise
 
 
@@ -502,9 +552,11 @@ __all__ = [
     "TurnResult",
     "agent_for_turn",
     "configure_runtime",
+    "exception_error",
     "execute",
     "load_history",
     "reset_agent_cache",
     "run_turn",
     "runtime_configured",
+    "usage_so_far",
 ]
