@@ -12,9 +12,27 @@ Core record             complete in code and tests
 Tools and recovery      complete in code and tests
 DBOS 3.0 migration      complete in code and recovery evidence
 Fan-out                 complete in code and tests
+Run cancellation       complete in code and tests
 Deployment/operations   installed and verified; reboot, second-UID, clone, and sustained-router checks are documented
 Product expansion       proposed; concept review pending
 ```
+
+## Run cancellation
+
+The daemon cancels runs by id. The CLI also selects running runs by thread or
+workspace. A client disconnect cancels its turn. The model step stops within
+about one second. An active tool step finishes so its side-effect record stays
+complete.
+
+The next cancellation work is:
+
+- update karakeep-archive to cancel after a client timeout when health reports
+  the `cancel` capability;
+- allow `max_transport_retries` for `openai:` models;
+- count usage from interrupted model requests when the server exposes it;
+- subscribe before workflow startup so the first stream events are not lost;
+- change Strata only if the live probe proves that it keeps generating after
+  the client closes its stream.
 
 ## P0 — complete the operating model
 

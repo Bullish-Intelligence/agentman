@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import agentman.cli as cli
@@ -15,7 +17,7 @@ from agentman.client import DaemonError, TurnOutcome
 from agentman.config import CONFIG_FILENAME, Config, ConfigError, Value
 from agentman.discovery import Directories
 from agentman.model import ModelResolutionError
-from agentman.protocol import PROTOCOL_VERSION, TurnResponse
+from agentman.protocol import PROTOCOL_VERSION, StreamEnvelope, TurnResponse
 from agentman.schema import OutputValidationError
 
 
@@ -175,6 +177,47 @@ def test_cli_success_uses_exit_code_zero(monkeypatch: pytest.MonkeyPatch) -> Non
     result = CliRunner().invoke(app, ["send", "hello"])
 
     assert result.exit_code == cli.EXIT_OK, result.output
+
+
+def test_send_reports_turn_error_after_client_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    context, setup = _fanout_test_setup()
+    client_closed = False
+    failures: list[tuple[str, int, bool]] = []
+
+    class FakeClient:
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            nonlocal client_closed
+            client_closed = True
+
+        async def stream_turn(self, request: object):
+            yield StreamEnvelope(
+                run_id="run-1",
+                request_ordinal=-1,
+                event_ordinal=-1,
+                kind="turn_error",
+                event={"error": "turn cancelled"},
+                final=True,
+            )
+
+    def fail(message: str, code: int = cli.EXIT_CONFIG) -> None:
+        failures.append((message, code, client_closed))
+        raise typer.Exit(code)
+
+    monkeypatch.setattr(cli, "_context", lambda **_: context)
+    monkeypatch.setattr(cli, "_prepare_turn", lambda _: setup)
+    monkeypatch.setattr(cli, "_ensure_current_thread", lambda *_: asyncio.sleep(0, result="thread-1"))
+    monkeypatch.setattr(cli, "_turn_request", lambda *_, **__: object())
+    monkeypatch.setattr(cli, "_client", lambda _: FakeClient())
+    monkeypatch.setattr(cli, "_fail", fail)
+
+    with pytest.raises(typer.Exit) as error:
+        asyncio.run(cli._one_turn("hello", agent=None, model=None, json_output=False))
+
+    assert error.value.exit_code == cli.EXIT_FINDING
+    assert failures == [("turn cancelled", cli.EXIT_FINDING, True)]
 
 
 def test_cli_configuration_failure_uses_exit_code_two(monkeypatch: pytest.MonkeyPatch) -> None:

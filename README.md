@@ -10,7 +10,8 @@ The project has a durable, workspace-scoped agent runtime with:
 - Postgres-backed threads, runs, model events, snapshots, messages, and tool
   effects;
 - workspace-scoped `coder` tools with file-image evidence for recovery;
-- status inspection and policy-gated DBOS workflow resumption; and
+- status inspection and policy-gated DBOS workflow resumption;
+- cancellation by run id, thread, workspace, or client disconnect; and
 - concurrent stdin fan-out through `pipe --each`.
 
 The detailed documentation set is the source for the product and operational
@@ -46,6 +47,12 @@ devenv up -d          # start the project Postgres service
 
 See [Getting started](docs/getting-started.md) for daemon configuration and a
 first typed turn.
+
+Cancel a running turn by id:
+
+```bash
+agentman cancel <run-id>
+```
 
 ## Verify
 
