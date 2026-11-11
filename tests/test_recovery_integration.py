@@ -58,7 +58,13 @@ def _slow_response_model() -> Any:
     return FunctionModel(respond, model_name="slow-recovery")
 
 
-def _patched_build_model(model_string: str, *, router_url: str | None, n_ctx: int | None) -> Any:
+def _patched_build_model(
+    model_string: str,
+    *,
+    router_url: str | None,
+    n_ctx: int | None,
+    max_transport_retries: int | None = None,
+) -> Any:
     """Match ``agentman.runtime.build_model`` so both interpreters build the same model."""
     return _slow_response_model()
 

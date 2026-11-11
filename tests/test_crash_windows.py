@@ -55,7 +55,13 @@ async def _tool_model_stream(messages: list[ModelMessage], info: AgentInfo):
     }
 
 
-def _build_crash_model(model_string: str, *, router_url: str | None, n_ctx: int | None) -> FunctionModel:
+def _build_crash_model(
+    model_string: str,
+    *,
+    router_url: str | None,
+    n_ctx: int | None,
+    max_transport_retries: int | None = None,
+) -> FunctionModel:
     return FunctionModel(stream_function=_tool_model_stream, model_name="crash-window")
 
 
