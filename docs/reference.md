@@ -44,7 +44,7 @@ allows one initial request and no transport retry. The option applies only to
 | `show` | `[THREAD]` | With no argument, renders the current thread. With an argument, resolves it as a thread name, not an arbitrary id. |
 | `status` | none | Reads the local current-thread pointer and prints status. With no pointer it prints `no current thread` and exits successfully. |
 | `resume` | `RUN_ID [--yes]` | Fetches the run, verifies its workspace, prints status, optionally confirms, and delegates resumption to DBOS. |
-| `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running runs in the named thread. `--all-running` selects running runs in every workspace thread. |
+| `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running runs in the named thread. `--all-running` selects running runs in every workspace thread. A selector can pick several runs. The command tries every run, even after an error, and prints each error on stderr. The exit code is `2` if any run failed with an error, else `1` if any run was already final, else `0`. |
 | `config` | none | Prints resolved values and provenance, including inferference's resolved router URL when applicable. |
 | `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. |
 | `pipe` | `[PREAMBLE] [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json] [--each]` | Reads all stdin. Without `--each`, stdin is one turn; with it, each physical line is an independent ordinary run. |
@@ -81,6 +81,8 @@ input is reported by its one-based input index. Text output is prefixed with
 | `-j`/ `--jobs` without `--each` | Error on stderr, exit code `3` |
 | `cancel` has no selector or more than one selector | Error on stderr, exit code `3` |
 | Missing socket, invalid config/spec, schema-import failure, unavailable database/router, or daemon HTTP error | Error on stderr, exit code `2` |
+| The connection to the daemon fails during a call (for example a daemon restart during a turn stream) | Error on stderr, exit code `2` |
+| The daemon sends a response this client cannot read (a protocol skew) | Error on stderr that says to upgrade the client and daemon together, exit code `2` |
 | Daemon health has no `cancel` capability | Error on stderr, exit code `2` |
 | `pipe --each` cannot discover parallelism for a non-inferference model without an explicit job count | Error on stderr, exit code `2` |
 | An explicit transport retry limit uses a non-inferference model | Error before the run starts, exit code `2` |
@@ -89,6 +91,8 @@ input is reported by its one-based input index. Text output is prefixed with
 | `status` has no current thread | Prints `no current thread`, exit code `0` |
 | `cancel --thread` or `cancel --all-running` finds no running run | Prints `no running run`, exit code `0` |
 | `cancel RUN_ID` finds a terminal run | Prints `not cancelled <run-id>: already <status>`, exit code `1` |
+| `cancel --thread` or `cancel --all-running` cannot cancel one run because of an error | Prints the error on stderr, tries the remaining runs, exit code `2` |
+| `cancel --thread` or `cancel --all-running` finds a terminal run and no error | Prints `not cancelled <run-id>: already <status>` for it, exit code `1` |
 
 ## `pipe --each`
 
@@ -219,6 +223,9 @@ fields. Upgrade the client and daemon together.
 | `POST /v1/resume` | workspace and run id | `ResumeResponse` |
 | `POST /v1/runs/<id>/cancel` | workspace | `CancelResponse` |
 
+The cancel route answers `404` for an unknown run. It answers `409` for a run
+in another workspace, and for a run that DBOS could not cancel.
+
 `RunInfo` carries the run status (`running`, `completed`, `failed`, or
 `cancelled`), the usage known so far, and `error`. `error` is null unless the
 run ended without a result. Then it names the `reason` (`exception`,
@@ -264,7 +271,15 @@ with `turn_error`. Its event contains `error: "turn cancelled"`, the cancel
 reason, and the run id. A connected client receives that final frame. The
 daemon records the cancellation reason on the run and closes the model stream.
 A disconnected client receives no more frames. The daemon cancels its workflow
-and removes the subscriber and local wait tasks.
+and removes the subscriber and local wait tasks. A client that closes the
+stream, for any reason, therefore cancels the turn. The reason is
+`client_disconnected`.
+
+The client sets no read timeout on a turn stream. A turn can send no data for a
+long time, for example during a long tool call, and a read timeout would close
+the stream and cancel the turn. Other calls keep the 300 second timeout. The
+CLI exits with code `2` when the connection to the daemon fails during a
+stream.
 
 ## Important errors
 

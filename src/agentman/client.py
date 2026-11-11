@@ -9,7 +9,8 @@ message naming the foreground command.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +72,9 @@ class Client:
         self.socket_path = str(socket_path)
         transport = httpx.AsyncHTTPTransport(uds=self.socket_path)
         self._client = httpx.AsyncClient(transport=transport, base_url="http://agentman", timeout=timeout)
+        # A turn can stay silent for a long time. A read timeout would close the
+        # stream, and the daemon cancels a turn when its client disconnects.
+        self._stream_timeout = httpx.Timeout(timeout, read=None)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -143,9 +147,10 @@ class Client:
 
     # -- the turn --------------------------------------------------------------
 
-    async def stream_turn(self, request: TurnRequest) -> AsyncIterator[StreamEnvelope]:
-        async for envelope in _deduplicate(self._raw_stream(request)):
-            yield envelope
+    async def stream_turn(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
+        async with aclosing(self._raw_stream(request)) as raw, aclosing(_deduplicate(raw)) as unique:
+            async for envelope in unique:
+                yield envelope
 
     async def stream_turns(self, requests: list[TurnRequest], *, concurrency: int) -> list[TurnOutcome]:
         """Collect several normal turn streams with a local in-flight bound.
@@ -162,32 +167,33 @@ class Client:
             async with limiter:
                 try:
                     final: TurnResponse | None = None
-                    async for envelope in self.stream_turn(request):
-                        if envelope.final:
-                            if envelope.kind == "turn_error":
-                                message = envelope.event.get("error")
-                                return TurnOutcome(
-                                    index=index,
-                                    error=TurnStreamError(
-                                        message if isinstance(message, str) else "the daemon reported a failed turn"
-                                    ),
-                                )
-                            if envelope.kind != "turn_result":
-                                return TurnOutcome(
-                                    index=index,
-                                    error=TurnStreamError(f"the daemon sent unknown final frame {envelope.kind!r}"),
-                                )
-                            final = TurnResponse.model_validate(envelope.event)
+                    async with aclosing(self.stream_turn(request)) as stream:
+                        async for envelope in stream:
+                            if envelope.final:
+                                if envelope.kind == "turn_error":
+                                    message = envelope.event.get("error")
+                                    return TurnOutcome(
+                                        index=index,
+                                        error=TurnStreamError(
+                                            message if isinstance(message, str) else "the daemon reported a failed turn"
+                                        ),
+                                    )
+                                if envelope.kind != "turn_result":
+                                    return TurnOutcome(
+                                        index=index,
+                                        error=TurnStreamError(f"the daemon sent unknown final frame {envelope.kind!r}"),
+                                    )
+                                final = TurnResponse.model_validate(envelope.event)
                     return TurnOutcome(index=index, response=final)
                 except Exception as error:
                     return TurnOutcome(index=index, error=error)
 
         return list(await asyncio.gather(*(one(index, request) for index, request in enumerate(requests))))
 
-    async def _raw_stream(self, request: TurnRequest) -> AsyncIterator[StreamEnvelope]:
+    async def _raw_stream(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
         data = request.model_dump(mode="json")
         try:
-            async with self._client.stream("POST", "/v1/turns", json=data) as response:
+            async with self._client.stream("POST", "/v1/turns", json=data, timeout=self._stream_timeout) as response:
                 if response.status_code != httpx.codes.OK:
                     body = (await response.aread()).decode()
                     raise DaemonError(
@@ -242,7 +248,7 @@ def _parse_frame(frame: str) -> StreamEnvelope | None:
 
 async def _deduplicate(
     source: AsyncIterator[StreamEnvelope],
-) -> AsyncIterator[StreamEnvelope]:
+) -> AsyncGenerator[StreamEnvelope]:
     """Drop repeated frames on ``(run_id, request ordinal, event ordinal)``.
 
     DBOS may re-execute a step after a crash, so events can repeat. The
