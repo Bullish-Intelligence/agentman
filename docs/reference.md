@@ -252,9 +252,12 @@ On success, the daemon drains live event frames and then emits one final
 `turn_result` envelope. If the workflow raises, it emits a final `turn_error`
 frame with a generic message. The CLI reports that as a finding (exit code
 `1`); callers should inspect `status` and the durable run record rather than
-treating a failed turn as proof that no work occurred. A disconnected client
-loses its live subscription; DBOS owns the durable workflow and the daemon
-cleans up the connection's subscriber and local wait tasks.
+treating a failed turn as proof that no work occurred. A cancellation also ends
+with `turn_error`. Its event contains `error: "turn cancelled"`, the cancel
+reason, and the run id. A connected client receives that final frame. The
+daemon records the cancellation reason on the run and closes the model stream.
+A disconnected client receives no more frames. The daemon cancels its workflow
+and removes the subscriber and local wait tasks.
 
 ## Important errors
 

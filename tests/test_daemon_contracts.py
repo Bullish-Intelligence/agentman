@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from dbos._error import DBOSAwaitedWorkflowCancelledError
 from inferference import ConstraintKind, ModelInfo
 from pydantic import ValidationError
 from pydantic_ai_harness.step_persistence import ToolEffectRecord
@@ -20,7 +22,7 @@ import agentman.daemon as daemon
 from agentman.config import Config, Value
 from agentman.daemon import AgentmanApp, _HttpError
 from agentman.persistence.store import Run
-from agentman.protocol import StreamEnvelope, TurnRequest
+from agentman.protocol import TurnRequest
 
 
 def _app() -> AgentmanApp:
@@ -35,7 +37,16 @@ def _app() -> AgentmanApp:
     )
 
 
-def _run(workspace: str, status: str = "running") -> Run:
+async def _wait_forever_receive() -> dict[str, Any]:
+    await asyncio.Future()
+    raise AssertionError("the receive task should be cancelled")
+
+
+def _run(
+    workspace: str,
+    status: str = "running",
+    error: dict[str, Any] | None = None,
+) -> Run:
     now = datetime.now(UTC)
     return Run(
         id="run-1",
@@ -51,6 +62,7 @@ def _run(workspace: str, status: str = "running") -> Run:
         usage=None,
         created_at=now,
         updated_at=now,
+        error=error,
     )
 
 
@@ -63,6 +75,25 @@ class _Store:
 
     async def get_thread(self, thread_id: str) -> object:
         return SimpleNamespace(id=thread_id)
+
+
+class _CancelStore(_Store):
+    def __init__(self, run: Run) -> None:
+        super().__init__(run)
+        self.updates: list[dict[str, Any]] = []
+
+    async def get_run(self, run_id: str) -> Run | None:
+        return self.run if self.run is not None and self.run.id == run_id else None
+
+    async def update_run(self, run_id: str, **fields: Any) -> None:
+        assert self.run is not None and self.run.id == run_id
+        self.updates.append(dict(fields))
+        self.run = replace(self.run, **fields)
+
+
+class _EmptyStepStore:
+    async def latest_snapshot(self, *, run_id: str, include_interrupted: bool) -> None:
+        return None
 
 
 class _Journal:
@@ -263,7 +294,7 @@ def test_unsupported_transport_retry_limit_fails_before_workflow_or_capability_l
 
         request = _turn_request(model="anthropic:claude", max_transport_retries=0)
         with pytest.raises(_HttpError, match="cannot enforce `max_transport_retries`") as error:
-            await app._handle_turn(request.model_dump_json().encode(), send)
+            await app._handle_turn(request.model_dump_json().encode(), _wait_forever_receive, send)
         assert error.value.status == 422
 
     asyncio.run(exercise())
@@ -358,7 +389,9 @@ def test_failed_workflow_emits_terminal_error_without_exception_details(monkeypa
         async def send(message: dict[str, Any]) -> None:
             sent.append(message)
 
-        await app._handle_turn(_turn_request(model="mock:model").model_dump_json().encode(), send)
+        await app._handle_turn(
+            _turn_request(model="mock:model").model_dump_json().encode(), _wait_forever_receive, send
+        )
 
     asyncio.run(exercise())
     frames = [message["body"].decode() for message in sent if message.get("more_body")]
@@ -369,61 +402,113 @@ def test_failed_workflow_emits_terminal_error_without_exception_details(monkeypa
     assert "private model response" not in frames[0]
 
 
-def test_disconnect_removes_subscriber_without_canceling_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_turn_handler_cancels_the_run_on_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     app = _app()
-    app.store = cast(Any, _Store())
-    completed = False
-    workflow_tasks: list[asyncio.Task[None]] = []
+    store = _CancelStore(_run("/repo"))
+    app.store = cast(Any, store)
+    app.step_store = cast(Any, _EmptyStepStore())
+    cancelled: list[str] = []
+    cancellation_requested = asyncio.Event()
 
     class _Handle:
         def get_workflow_id(self) -> str:
             return "run-1"
 
         async def get_result(self) -> object:
-            await workflow_tasks[0]
-            return SimpleNamespace(
-                run_id="run-1",
-                thread_id="thread-1",
-                output="done",
-                output_type="str",
-                messages=[],
-                usage=None,
-                run_metadata={},
-            )
+            await cancellation_requested.wait()
+            raise DBOSAwaitedWorkflowCancelledError("run-1")
 
     class _DBOS:
         @staticmethod
         async def start_workflow_async(*_: object) -> _Handle:
-            async def durable_workflow() -> None:
-                nonlocal completed
-                await asyncio.sleep(0.02)
-                app.registry.publish(
-                    "run-1",
-                    StreamEnvelope(
-                        run_id="run-1",
-                        request_ordinal=1,
-                        event_ordinal=0,
-                        kind="part_delta",
-                        event={"event_kind": "part_delta"},
-                    ),
-                )
-                await asyncio.sleep(0.03)
-                completed = True
+            return _Handle()
 
-            workflow_tasks.append(asyncio.create_task(durable_workflow()))
+        @staticmethod
+        async def cancel_workflow_async(run_id: str) -> None:
+            cancelled.append(run_id)
+            cancellation_requested.set()
+
+        @staticmethod
+        async def get_workflow_status_async(run_id: str) -> SimpleNamespace:
+            return SimpleNamespace(status="CANCELLED")
+
+    monkeypatch.setattr(daemon, "DBOS", _DBOS)
+    sent: list[dict[str, Any]] = []
+    disconnected = False
+
+    async def exercise() -> None:
+        nonlocal disconnected
+        request = _turn_request(model="mock:model")
+        messages = iter(
+            (
+                {"type": "http.request", "body": request.model_dump_json().encode(), "more_body": False},
+                {"type": "http.disconnect"},
+            )
+        )
+
+        async def receive() -> dict[str, Any]:
+            nonlocal disconnected
+            message = next(messages)
+            if message["type"] == "http.disconnect":
+                disconnected = True
+            return message
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._http({"method": "POST", "path": "/v1/turns", "query_string": b""}, receive, send)
+
+    asyncio.run(exercise())
+    assert cancelled == ["run-1"]
+    assert disconnected
+    assert store.run.status == "cancelled"
+    assert store.run.error == {"reason": "client_disconnected", "type": None, "message": None}
+    assert store.updates[0]["usage"]["requests"] == 0
+    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert app.registry._queues == {}
+
+
+def test_turn_handler_sends_turn_error_with_the_cancel_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    app.store = cast(
+        Any,
+        _CancelStore(
+            _run(
+                workspace="/repo",
+                status="cancelled",
+                error={"reason": "cancel_requested", "type": None, "message": None},
+            )
+        ),
+    )
+
+    class _Handle:
+        def get_workflow_id(self) -> str:
+            return "run-1"
+
+        async def get_result(self) -> object:
+            raise DBOSAwaitedWorkflowCancelledError("run-1")
+
+    class _DBOS:
+        @staticmethod
+        async def start_workflow_async(*_: object) -> _Handle:
             return _Handle()
 
     monkeypatch.setattr(daemon, "DBOS", _DBOS)
+    sent: list[dict[str, Any]] = []
 
     async def exercise() -> None:
         async def send(message: dict[str, Any]) -> None:
-            if message.get("more_body"):
-                raise OSError("client disconnected")
+            sent.append(message)
 
-        with pytest.raises(OSError, match="client disconnected"):
-            await app._handle_turn(_turn_request(model="mock:model").model_dump_json().encode(), send)
-        await workflow_tasks[0]
+        await app._handle_turn(
+            _turn_request(model="mock:model").model_dump_json().encode(), _wait_forever_receive, send
+        )
 
     asyncio.run(exercise())
-    assert completed
-    assert app.registry._queues == {}
+    frames = [message["body"].decode() for message in sent if message.get("more_body")]
+    assert len(frames) == 1
+    assert "event: turn_error" in frames[0]
+    assert '"error":"turn cancelled"' in frames[0]
+    assert '"reason":"cancel_requested"' in frames[0]
+    assert '"run_id":"run-1"' in frames[0]
+    assert '"final":true' in frames[0]

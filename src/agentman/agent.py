@@ -24,7 +24,7 @@ from pydantic_ai import Agent, StructuredDict
 from pydantic_ai.agent.abstract import EventStreamHandler
 from pydantic_ai.agent.spec import AgentSpec
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.durable_exec.dbos import DBOSDurability
+from pydantic_ai.durable_exec.dbos import DBOSDurability, StepConfig
 from pydantic_ai.messages import ModelResponseStreamEvent
 from pydantic_ai.models import Model
 from pydantic_ai.tools import RunContext
@@ -140,7 +140,14 @@ def turn_capabilities(
         # permissions are the access boundary for this system-level capability.
         capabilities.append(FileEffectEvidence(store=store, workspace=workspace))
         capabilities.append(_coder(workspace))
-    capabilities.append(_SerializableDBOSDurability(event_stream_handler=event_stream_handler, name=durability_name))
+    capabilities.append(
+        _SerializableDBOSDurability(
+            event_stream_handler=event_stream_handler,
+            name=durability_name,
+            # Cancel the model request so its upstream stream closes. Tool steps stay durable.
+            model_step_config=cast(StepConfig, {"preemptible": True}),
+        )
+    )
     return capabilities
 
 

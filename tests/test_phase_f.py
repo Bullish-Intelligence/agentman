@@ -199,8 +199,5 @@ async def test_concurrent_turns_overlap_in_wall_clock() -> None:
             model=model,
         )
 
-    started = asyncio.get_event_loop().time()
     await asyncio.gather(*(one(index) for index in range(4)))
-    makespan = asyncio.get_event_loop().time() - started
-    serial = 4 * delay
-    assert makespan < serial * 0.75, f"turns serialised: makespan {makespan:.2f}s vs serial {serial:.2f}s"
+    assert mock.max_active_calls > 1, f"model requests did not overlap: {mock.max_active_calls} active call(s)"
