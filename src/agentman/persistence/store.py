@@ -186,6 +186,23 @@ class Store:
         async with self._engine.begin() as connection:
             await connection.execute(update(run_table).where(run_table.c.id == run_id).values(**fields))
 
+    async def finish_run(self, run_id: str, **fields: Any) -> bool:
+        """Write the final status of a run only while it is ``running``.
+
+        The first writer of a final status wins. The check and the write are one
+        statement, so two writers cannot both succeed. Return ``True`` when this
+        call changed the row, and ``False`` when the run was already final or
+        does not exist.
+        """
+        if fields.get("status") not in RUN_TERMINAL:
+            raise ValueError("finish_run needs a final status")
+        fields["updated_at"] = datetime.now(UTC)
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(run_table).where(run_table.c.id == run_id, run_table.c.status == RUN_RUNNING).values(**fields)
+            )
+        return result.rowcount > 0
+
     async def get_run(self, run_id: str) -> Run | None:
         async with self._engine.connect() as connection:
             row = (await connection.execute(select(run_table).where(run_table.c.id == run_id))).mappings().first()

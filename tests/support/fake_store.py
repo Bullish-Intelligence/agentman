@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from agentman.persistence.store import RUN_RUNNING, Run, Thread
+from agentman.persistence.store import RUN_RUNNING, RUN_TERMINAL, Run, Thread
 
 
 class FakeProductStore:
@@ -62,6 +62,14 @@ class FakeProductStore:
         if current is None:
             return
         self.runs[run_id] = dataclasses.replace(current, updated_at=datetime.now(UTC), **fields)
+
+    async def finish_run(self, run_id: str, **fields: Any) -> bool:
+        current = self.runs.get(run_id)
+        assert fields.get("status") in RUN_TERMINAL
+        if current is None or current.status != RUN_RUNNING:
+            return False
+        self.runs[run_id] = dataclasses.replace(current, updated_at=datetime.now(UTC), **fields)
+        return True
 
     async def get_run(self, run_id: str) -> Run | None:
         return self.runs.get(run_id)
