@@ -819,3 +819,27 @@ async def test_a_mixed_group_is_not_treated_as_a_cancellation() -> None:
     assert caught.value is group
     run = await product.get_run("run-1")
     assert run is not None and run.status == "running"
+
+
+def test_agent_for_turn_passes_the_router_key_to_build_model(monkeypatch) -> None:
+    from agentman import runtime
+
+    seen: list[str | None] = []
+
+    def fake_build_model(model_string: str, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("api_key"))
+        return build_mock_model(MockOpenAI())
+
+    monkeypatch.setenv("MY_ROUTER_KEY", "k-runtime")
+    monkeypatch.setattr(runtime, "build_model", fake_build_model)
+    monkeypatch.setattr(
+        runtime,
+        "_runtime",
+        runtime.Runtime(
+            step_store=InMemoryStepStore(), product_store=FakeProductStore(), router_key_env="MY_ROUTER_KEY"
+        ),
+    )
+    reset_agent_cache()
+    agent_for_turn(_turn("t-key"), step_store=InMemoryStepStore(), event_stream_handler=None)
+    reset_agent_cache()
+    assert seen == ["k-runtime"]

@@ -145,10 +145,27 @@ CLI flag → repository config → global config → built-in default
 | `database_url` | global only | Daemon and migration database URL | unset, except `AGENTMAN_DATABASE_URL` |
 | `socket` | global only | Unix socket path | `$XDG_RUNTIME_DIR/agentman.sock` or `/run/user/<uid>/agentman.sock` |
 | `router_url` | global only | Optional inferference endpoint override | inferference placement resolution |
+| `router_key_env` | global only | Name of the environment variable that holds the router API key | `OPENAI_API_KEY` |
 
 The repository file may contain only `agent` and `model`. Putting a global-only
 key in it is a configuration error. `agentman config` prints source provenance;
 when `router_url` is unset it also displays the URL inferference resolves.
+
+### Router API key
+
+A router can require an API key. The daemon sends the key as
+`Authorization: Bearer <key>` on every router request: the capability probe and
+the chat requests. The CLI sends it when `pipe --each` discovers parallelism.
+
+The config file never holds the key. `router_key_env` names the environment
+variable that holds it. The default is `OPENAI_API_KEY`, which the chat model
+client already reads. Put the variable in the environment of the daemon, for
+example with a systemd `EnvironmentFile=` that has mode `0600`.
+
+When the variable is unset or empty, agentman sends no `Authorization` header.
+A router that needs no key works unchanged. agentman never logs the key and
+never puts it in an error message. `agentman config` shows the variable name,
+not its value.
 
 ## Agent specifications
 
@@ -284,7 +301,7 @@ stream.
 ## Important errors
 
 - A missing socket means the foreground daemon is not running in development.
-- A repository config containing `database_url`, `socket`, or `router_url` is
+- A repository config containing `database_url`, `socket`, `router_url`, or `router_key_env` is
   invalid by design.
 - A missing `output` type module or invalid result is a client-side finding or
   configuration error, not a daemon-side import problem.

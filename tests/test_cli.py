@@ -397,7 +397,9 @@ def test_pipe_each_no_value_jobs_uses_default_through_the_cli_path(
     parallelism_calls: list[tuple[str, int | None, str | None]] = []
     ensure_calls: list[str] = []
 
-    async def fake_parallelism(model: str, *, jobs: int | None, router_url: str | None) -> int:
+    async def fake_parallelism(
+        model: str, *, jobs: int | None, router_url: str | None, api_key: str | None = None
+    ) -> int:
         parallelism_calls.append((model, jobs, router_url))
         return 2
 

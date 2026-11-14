@@ -27,7 +27,7 @@ from pydantic_ai.messages import AgentStreamEvent
 from agentman import __version__
 from agentman.config import Config
 from agentman.model import PREFIX as MODEL_PREFIX
-from agentman.model import ModelResolutionError, require_schema, resolve_capability_model
+from agentman.model import ModelResolutionError, require_schema, resolve_capability_model, router_api_key
 from agentman.persistence.engine import create_engine
 from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
@@ -156,6 +156,7 @@ class AgentmanApp:
             step_store=self.step_store,
             product_store=self.store,
             event_stream_handler=make_event_handler(self.registry),
+            router_key_env=self.config.router_key_env.value,
         )
         DBOS(
             config=DBOSConfig(
@@ -561,7 +562,7 @@ class AgentmanApp:
             from inferference import resolve_router_url
 
             self.router_url = resolve_router_url()
-        client = InferferenceClient(self.router_url)
+        client = InferferenceClient(self.router_url, api_key=router_api_key(self.config.router_key_env.value))
         try:
             return await client.capabilities()
         finally:

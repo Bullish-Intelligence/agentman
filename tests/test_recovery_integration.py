@@ -64,6 +64,7 @@ def _patched_build_model(
     router_url: str | None,
     n_ctx: int | None,
     max_transport_retries: int | None = None,
+    api_key: str | None = None,
 ) -> Any:
     """Match ``agentman.runtime.build_model`` so both interpreters build the same model."""
     return _slow_response_model()

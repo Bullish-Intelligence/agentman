@@ -61,6 +61,7 @@ def _build_crash_model(
     router_url: str | None,
     n_ctx: int | None,
     max_transport_retries: int | None = None,
+    api_key: str | None = None,
 ) -> FunctionModel:
     return FunctionModel(stream_function=_tool_model_stream, model_name="crash-window")
 

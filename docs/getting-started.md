@@ -47,9 +47,12 @@ database_url: postgresql+asyncpg://<role>@127.0.0.1:5433/agentman
 socket: /run/user/<uid>/agentman.sock
 # Optional when inferference cannot resolve its own placement:
 # router_url: http://127.0.0.1:<port>
+# Optional: the environment variable that holds the router API key.
+# The default is OPENAI_API_KEY. Never put the key itself in this file.
+# router_key_env: OPENAI_API_KEY
 ```
 
-`database_url`, `socket`, and `router_url` are global-only keys. They must not
+`database_url`, `socket`, `router_url`, and `router_key_env` are global-only keys. They must not
 be placed in a repository’s tracked `.agentman/agentman.yaml`. For one-off
 migrations or test environments, `AGENTMAN_DATABASE_URL` may provide the
 database URL when no higher-precedence config value exists.

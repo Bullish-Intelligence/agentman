@@ -22,10 +22,16 @@ CONFIG_FILENAME = "agentman.yaml"
 REPO_KEYS = ("agent", "model")
 """Keys a repository config may set."""
 
-GLOBAL_ONLY_KEYS = ("database_url", "socket", "router_url")
+GLOBAL_ONLY_KEYS = ("database_url", "socket", "router_url", "router_key_env")
 """Keys only the global config may set. A repository that names one is an error."""
 
 CONFIG_KEYS = REPO_KEYS + GLOBAL_ONLY_KEYS
+
+DEFAULT_ROUTER_KEY_ENV = "OPENAI_API_KEY"
+"""The environment variable that holds the router API key, unless config names another.
+
+The chat model client already reads this variable, so one key serves both the
+capability probe and the chat requests."""
 
 DEFAULT_AGENT = "default"
 """The built-in agent name, used when no scope names one."""
@@ -56,6 +62,7 @@ class Config:
     database_url: Value
     socket: Value
     router_url: Value
+    router_key_env: Value = Value(DEFAULT_ROUTER_KEY_ENV, "default")
 
     def get(self, key: str) -> Value:
         if key not in CONFIG_KEYS:
@@ -121,6 +128,8 @@ def _default(key: str) -> str | None:
         return DEFAULT_AGENT
     if key == "socket":
         return str(default_socket_path())
+    if key == "router_key_env":
+        return DEFAULT_ROUTER_KEY_ENV
     return None
 
 
@@ -164,6 +173,7 @@ __all__ = [
     "CONFIG_FILENAME",
     "CONFIG_KEYS",
     "DEFAULT_AGENT",
+    "DEFAULT_ROUTER_KEY_ENV",
     "GLOBAL_ONLY_KEYS",
     "REPO_KEYS",
     "Config",

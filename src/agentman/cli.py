@@ -25,7 +25,7 @@ from agentman import __version__
 from agentman.client import Client, DaemonError, DaemonNotRunning, TurnStreamError
 from agentman.config import Config, ConfigError, load_config, provenance
 from agentman.discovery import Directories, global_directory, resolve_directories, resolve_workspace
-from agentman.model import ModelResolutionError, resolve_parallelism
+from agentman.model import ModelResolutionError, resolve_parallelism, router_api_key
 from agentman.protocol import PROTOCOL_VERSION, TurnRequest, TurnResponse
 from agentman.render import render_thread
 from agentman.schema import OutputValidationError, SchemaError, schema_out, validate_output
@@ -511,6 +511,7 @@ async def _fan_out(
         setup.model,
         jobs=jobs,
         router_url=context.config.router_url.value,
+        api_key=router_api_key(context.config.router_key_env.value),
     )
     prompts = [_compose_pipe_message(preamble, record) for record in records]
 

@@ -386,7 +386,7 @@ def test_capabilities_resolve_router_for_a_repository_model(monkeypatch: pytest.
     clients: list[str] = []
 
     class _Client:
-        def __init__(self, url: str) -> None:
+        def __init__(self, url: str, *, api_key: str | None = None) -> None:
             clients.append(url)
 
         async def capabilities(self) -> _Capabilities:
@@ -400,6 +400,63 @@ def test_capabilities_resolve_router_for_a_repository_model(monkeypatch: pytest.
     asyncio.run(app._capabilities())
     assert app.router_url == "http://resolved.test/v1"
     assert clients == ["http://resolved.test/v1"]
+
+
+class _KeyClient:
+    keys: list[str | None] = []
+
+    def __init__(self, url: str, *, api_key: str | None = None) -> None:
+        self.keys.append(api_key)
+
+    async def capabilities(self) -> _Capabilities:
+        return _Capabilities()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_capabilities_send_the_key_from_the_default_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _KeyClient.keys = []
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-default")
+    monkeypatch.setattr(daemon, "InferferenceClient", _KeyClient)
+    asyncio.run(_app()._capabilities())
+    assert _KeyClient.keys == ["secret-default"]
+
+
+def test_capabilities_send_the_key_from_the_configured_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _KeyClient.keys = []
+    monkeypatch.setenv("OPENAI_API_KEY", "wrong")
+    monkeypatch.setenv("MY_ROUTER_KEY", "secret-named")
+    monkeypatch.setattr(daemon, "InferferenceClient", _KeyClient)
+    app = _app()
+    app.config = replace(app.config, router_key_env=Value("MY_ROUTER_KEY", "test"))
+    asyncio.run(app._capabilities())
+    assert _KeyClient.keys == ["secret-named"]
+
+
+def test_capabilities_send_no_key_when_the_variable_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    _KeyClient.keys = []
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(daemon, "InferferenceClient", _KeyClient)
+    asyncio.run(_app()._capabilities())
+    assert _KeyClient.keys == [None]
+
+
+def test_the_key_never_reaches_the_log_or_the_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _Failing(_KeyClient):
+        async def capabilities(self) -> _Capabilities:
+            raise RuntimeError("router said no")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-leak-check")
+    monkeypatch.setattr(daemon, "InferferenceClient", _Failing)
+    app = _app()
+    with caplog.at_level("DEBUG"), pytest.raises(_HttpError) as error:
+        asyncio.run(app._resolve_turn_model(_turn_request(schema=None)))
+    assert "secret-leak-check" not in str(error.value)
+    assert "secret-leak-check" not in caplog.text
+    assert "secret-leak-check" not in repr(app.config)
 
 
 def test_failed_workflow_emits_terminal_error_without_exception_details(monkeypatch: pytest.MonkeyPatch) -> None:

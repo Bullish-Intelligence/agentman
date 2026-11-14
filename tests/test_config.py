@@ -57,7 +57,7 @@ def test_repo_config_naming_global_only_key_fails(tmp_path: Path) -> None:
     assert str(repo_dir / CONFIG_FILENAME) in message
 
 
-@pytest.mark.parametrize("key", ["socket", "router_url"])
+@pytest.mark.parametrize("key", ["socket", "router_url", "router_key_env"])
 def test_every_global_only_key_is_refused_in_a_repo(tmp_path: Path, key: str) -> None:
     repo_dir = _scope(tmp_path, "repo", f"{key}: value\n")
     with pytest.raises(ConfigError):
@@ -86,3 +86,16 @@ def test_database_url_can_come_from_the_service_environment(monkeypatch: pytest.
 
     assert config.database_url.value == "postgresql+asyncpg://agentman@/agentman?host=/run/postgresql"
     assert config.database_url.source == "environment"
+
+
+def test_router_key_env_defaults_to_openai_api_key() -> None:
+    config = load_config()
+    assert config.router_key_env.value == "OPENAI_API_KEY"
+    assert config.router_key_env.source == "default"
+
+
+def test_router_key_env_can_name_another_variable(tmp_path: Path) -> None:
+    global_dir = _scope(tmp_path, "global", "router_key_env: MY_ROUTER_KEY\n")
+    config = load_config(global_dir=global_dir)
+    assert config.router_key_env.value == "MY_ROUTER_KEY"
+    assert config.router_key_env.source == str(global_dir / CONFIG_FILENAME)

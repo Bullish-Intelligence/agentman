@@ -43,6 +43,7 @@ from agentman.model import (
     TransportRequestCounter,
     bind_transport_request_counter,
     build_model,
+    router_api_key,
 )
 from agentman.model import PREFIX as MODEL_PREFIX
 from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_FAILED, RUN_TERMINAL
@@ -119,6 +120,8 @@ class Runtime:
     step_store: StepStore
     product_store: ProductStore
     event_stream_handler: EventStreamHandler[Any] | None = None
+    router_key_env: str | None = None
+    """The name of the environment variable that holds the router API key."""
 
 
 _runtime: Runtime | None = None
@@ -129,6 +132,7 @@ def configure_runtime(
     step_store: StepStore,
     product_store: ProductStore,
     event_stream_handler: EventStreamHandler[Any] | None = None,
+    router_key_env: str | None = None,
 ) -> None:
     """Install the collaborators the DBOS workflow body reads."""
     global _runtime
@@ -137,6 +141,7 @@ def configure_runtime(
         step_store=step_store,
         product_store=product_store,
         event_stream_handler=event_stream_handler,
+        router_key_env=router_key_env,
     )
 
 
@@ -241,6 +246,7 @@ def agent_for_turn(
             router_url=turn.router_url,
             n_ctx=turn.n_ctx,
             max_transport_retries=turn.max_transport_retries,
+            api_key=router_api_key(_runtime.router_key_env if _runtime is not None else None),
         )
         agent = _build_agent_for_turn(
             turn, step_store=step_store, event_stream_handler=event_stream_handler, model=model

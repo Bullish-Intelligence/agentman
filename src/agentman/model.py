@@ -14,7 +14,8 @@ callable.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+import os
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
+
+from agentman.config import DEFAULT_ROUTER_KEY_ENV
 
 PREFIX = "inferference:"
 """The model-string prefix that selects the local router."""
@@ -67,6 +70,17 @@ async def _count_chat_completion(request: httpx2.Request) -> None:
             counter.count += 1
 
 
+def router_api_key(env_name: str | None = None, environ: Mapping[str, str] | None = None) -> str | None:
+    """Return the router API key from the environment variable ``env_name``.
+
+    ``env_name`` defaults to ``OPENAI_API_KEY``. Return ``None`` when the
+    variable is unset or empty, so a router that needs no key sees no header.
+    The key is a secret: never log it and never put it in an error message.
+    """
+    source = os.environ if environ is None else environ
+    return source.get(env_name or DEFAULT_ROUTER_KEY_ENV) or None
+
+
 class ModelResolutionError(Exception):
     """The model string cannot be resolved to a usable model."""
 
@@ -76,6 +90,7 @@ async def resolve_parallelism(
     *,
     jobs: int | None,
     router_url: str | None = None,
+    api_key: str | None = None,
 ) -> int:
     """Resolve the client-side request bound for a fan-out.
 
@@ -94,7 +109,7 @@ async def resolve_parallelism(
         url = router_url or resolve_router_url()
     except Exception as error:
         raise ModelResolutionError(f"cannot resolve the inferference router: {error}") from error
-    client = InferferenceClient(url)
+    client = InferferenceClient(url, api_key=api_key)
     try:
         try:
             capabilities = await client.capabilities()
@@ -113,7 +128,7 @@ async def resolve_parallelism(
     return n_parallel
 
 
-async def resolve_model(model_string: str, *, router_url: str | None = None) -> Model | str:
+async def resolve_model(model_string: str, *, router_url: str | None = None, api_key: str | None = None) -> Model | str:
     """Resolve ``model_string`` to a model.
 
     An ``inferference:<name>`` string is validated against the live router and
@@ -123,7 +138,7 @@ async def resolve_model(model_string: str, *, router_url: str | None = None) -> 
     if not model_string.startswith(PREFIX):
         return model_string
     url = router_url or resolve_router_url()
-    client = InferferenceClient(url)
+    client = InferferenceClient(url, api_key=api_key)
     try:
         capabilities = await client.capabilities()
     finally:
@@ -131,7 +146,7 @@ async def resolve_model(model_string: str, *, router_url: str | None = None) -> 
     reference = model_string[len(PREFIX) :]
     require_schema(capabilities)
     resolved, model_info = resolve_capability_model(capabilities, reference)
-    return build_model(f"{PREFIX}{resolved}", router_url=url, n_ctx=model_info.n_ctx)
+    return build_model(f"{PREFIX}{resolved}", router_url=url, n_ctx=model_info.n_ctx, api_key=api_key)
 
 
 def resolve_capability_model(capabilities: Capabilities, reference: str):
@@ -152,6 +167,7 @@ def build_model(
     router_url: str | None,
     n_ctx: int | None,
     max_transport_retries: int | None = None,
+    api_key: str | None = None,
 ) -> Model | str:
     """Build a model from strings alone, with no I/O.
 
@@ -171,6 +187,7 @@ def build_model(
     base_url = _openai_base(router_url or resolve_router_url())
     default_provider = OpenAIProvider(
         base_url=base_url,
+        api_key=api_key,
         http_client=httpx2.AsyncClient(event_hooks={"request": [_count_chat_completion]}),
     )
     retry_limit = max_transport_retries if max_transport_retries is not None else DEFAULT_MAX_TRANSPORT_RETRIES
@@ -217,6 +234,7 @@ __all__ = [
     "TransportRequestCounter",
     "bind_transport_request_counter",
     "build_model",
+    "router_api_key",
     "profile_for",
     "resolve_capability_model",
     "require_schema",

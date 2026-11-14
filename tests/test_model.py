@@ -17,6 +17,7 @@ from agentman.model import (
     require_schema,
     resolve_model,
     resolve_parallelism,
+    router_api_key,
 )
 
 
@@ -99,8 +100,9 @@ def test_resolve_parallelism_reads_the_resolved_model_field_and_closes_client(mo
     class FakeClient:
         instances: list[FakeClient] = []
 
-        def __init__(self, url: str) -> None:
+        def __init__(self, url: str, *, api_key: str | None = None) -> None:
             self.url = url
+            self.api_key = api_key
             self.closed = False
             self.instances.append(self)
 
@@ -115,7 +117,54 @@ def test_resolve_parallelism_reads_the_resolved_model_field_and_closes_client(mo
     monkeypatch.setattr(model, "InferferenceClient", FakeClient)
     assert asyncio.run(resolve_parallelism("inferference:alias", jobs=None, router_url="http://router")) == 8
     assert FakeClient.instances[0].url == "http://router"
+    assert FakeClient.instances[0].api_key is None
     assert FakeClient.instances[0].closed
+
+
+def test_resolve_parallelism_passes_the_api_key_to_the_client(monkeypatch) -> None:
+    class FakeCapabilities:
+        def resolve_model_field(self, reference: str) -> str:
+            return reference
+
+        def model(self, name: str) -> ModelInfo:
+            return ModelInfo(name=name, n_parallel=2)
+
+    class FakeClient:
+        keys: list[str | None] = []
+
+        def __init__(self, url: str, *, api_key: str | None = None) -> None:
+            self.keys.append(api_key)
+
+        async def capabilities(self) -> FakeCapabilities:
+            return FakeCapabilities()
+
+        async def aclose(self) -> None:
+            pass
+
+    import agentman.model as model
+
+    monkeypatch.setattr(model, "InferferenceClient", FakeClient)
+    asyncio.run(resolve_parallelism("inferference:m", jobs=None, router_url="http://router", api_key="k-1"))
+    assert FakeClient.keys == ["k-1"]
+
+
+def test_router_api_key_reads_the_named_variable() -> None:
+    assert router_api_key("MY_KEY", {"MY_KEY": "k-1", "OPENAI_API_KEY": "other"}) == "k-1"
+
+
+def test_router_api_key_defaults_to_openai_api_key() -> None:
+    assert router_api_key(None, {"OPENAI_API_KEY": "k-2"}) == "k-2"
+
+
+@pytest.mark.parametrize("environ", [{}, {"OPENAI_API_KEY": ""}])
+def test_router_api_key_is_none_when_unset_or_empty(environ: dict[str, str]) -> None:
+    assert router_api_key(None, environ) is None
+
+
+def test_build_model_sends_the_api_key_as_a_bearer_header() -> None:
+    model = build_model(f"{PREFIX}gemma", router_url="http://127.0.0.1:8100", n_ctx=None, api_key="k-3")
+    assert isinstance(model, OpenAIChatModel)
+    assert model.provider.client.api_key == "k-3"
 
 
 def test_resolve_model_uses_the_resolved_model_field(monkeypatch) -> None:
@@ -143,7 +192,7 @@ def test_resolve_model_uses_the_resolved_model_field(monkeypatch) -> None:
     import agentman.model as model
 
     client = FakeClient()
-    monkeypatch.setattr(model, "InferferenceClient", lambda url: client)
+    monkeypatch.setattr(model, "InferferenceClient", lambda url, *, api_key=None: client)
     resolved = asyncio.run(model.resolve_model("inferference:alias", router_url="http://router"))
 
     assert isinstance(resolved, OpenAIChatModel)
@@ -175,7 +224,7 @@ def test_missing_advertised_parallelism_is_a_configuration_error(monkeypatch) ->
             return ModelInfo(name=name)
 
     class FakeClient:
-        def __init__(self, url: str) -> None:
+        def __init__(self, url: str, *, api_key: str | None = None) -> None:
             pass
 
         async def capabilities(self) -> FakeCapabilities:
