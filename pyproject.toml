@@ -43,13 +43,8 @@ dev = ["import-linter", "pytest", "pytest-asyncio", "ruff", "ty"]
 # The agentman contract: ``resolve_router_url``, ``config_dir``, per-model
 # ``n_parallel``/``n_ctx``, and ``loaded``. agentman never parses the router's
 # argv; that reads inside inferference.
-# The pin points at the public inferference repository.
-inferference = { git = "https://github.com/Bullish-Intelligence/inferference.git", rev = "5bcf4979fe3365a4a66ec25654da1ab09bffc5ba" }
-
-# inferference v0.3.0 omits its Hatch build backend from its own metadata. Keep
-# the dependency usable by isolated builds.
-[tool.uv.extra-build-dependencies]
-inferference = ["hatchling"]
+# The pin points at the public inferference repository, release v0.3.0.
+inferference = { git = "https://github.com/Bullish-Intelligence/inferference.git", rev = "a48ea62a4956c0de5016aacd1b130f79dfaf3aad" }
 
 [project.scripts]
 agentman = "agentman.cli:main"
