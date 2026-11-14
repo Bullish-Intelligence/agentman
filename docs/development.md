@@ -232,6 +232,9 @@ The important compatibility pins are intentional:
 - DBOS is pinned to the stable 3.0 line; and
 - inferference is pinned to the release that provides the agentman capability
   contract.
+- `[tool.uv.extra-build-dependencies]` adds hatchling for inferference. The
+  uv2nix builds of nix-meta and vendomat need it for the inferference git
+  source. Keep it, even though `uv sync` works without it.
 
 Read the relevant upstream behavior and record the reason before widening a
 range. A dependency bump that changes workflow or step storage requires the

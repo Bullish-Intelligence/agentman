@@ -46,6 +46,12 @@ dev = ["import-linter", "pytest", "pytest-asyncio", "ruff", "ty"]
 # The pin points at the public inferference repository, release v0.4.0.
 inferference = { git = "https://github.com/Bullish-Intelligence/inferference.git", rev = "101f82966f00fa32505ca8d67278fa43a211a499" }
 
+# The uv2nix build of the inferference git source needs hatchling. The nix-meta
+# and vendomat builds use uv2nix, and it does not read the build backend of a
+# git source. Keep this entry. A plain `uv sync` does not need it.
+[tool.uv.extra-build-dependencies]
+inferference = ["hatchling"]
+
 [project.scripts]
 agentman = "agentman.cli:main"
 
