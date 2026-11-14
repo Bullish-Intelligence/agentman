@@ -39,7 +39,7 @@ requires-dist = [
     { name = "dbos", specifier = ">=3.0,<3.1" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx2", specifier = ">=2.12,<3" },
-    { name = "inferference", git = "https://github.com/Bullish-Intelligence/inferference.git?rev=a48ea62a4956c0de5016aacd1b130f79dfaf3aad" },
+    { name = "inferference", git = "https://github.com/Bullish-Intelligence/inferference.git?rev=101f82966f00fa32505ca8d67278fa43a211a499" },
     { name = "psycopg", extras = ["binary"] },
     { name = "pydantic", specifier = ">=2" },
     { name = "pydantic-ai-harness", specifier = ">=0.31,<0.33" },
@@ -540,8 +540,8 @@ wheels = [
 
 [[package]]
 name = "inferference"
-version = "0.3.0"
-source = { git = "https://github.com/Bullish-Intelligence/inferference.git?rev=a48ea62a4956c0de5016aacd1b130f79dfaf3aad#a48ea62a4956c0de5016aacd1b130f79dfaf3aad" }
+version = "0.4.0"
+source = { git = "https://github.com/Bullish-Intelligence/inferference.git?rev=101f82966f00fa32505ca8d67278fa43a211a499#101f82966f00fa32505ca8d67278fa43a211a499" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
