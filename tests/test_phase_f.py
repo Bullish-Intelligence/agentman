@@ -12,6 +12,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
+import pytest
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -27,7 +28,7 @@ from support.openai_transport import MockOpenAI, build_mock_model
 
 from agentman.client import DaemonError, _deduplicate, _parse_frame
 from agentman.daemon import SubscriberRegistry, make_event_handler
-from agentman.protocol import StreamEnvelope
+from agentman.protocol import PROTOCOL_VERSION, StreamEnvelope
 from agentman.render import render_messages
 from agentman.runtime import Turn, run_turn
 
@@ -96,14 +97,24 @@ def test_client_parses_an_sse_frame() -> None:
 
 
 def test_client_rejects_an_unsupported_protocol_version() -> None:
-    envelope = StreamEnvelope(protocol=1, run_id="r", request_ordinal=1, event_ordinal=0, kind="part_delta")
-    frame = f"event: part_delta\ndata: {envelope.model_dump_json()}\n"
-    try:
-        _parse_frame(frame)
-    except DaemonError as error:
-        assert "protocol 1" in str(error)
-    else:
-        raise AssertionError("the client accepted an unsupported protocol")
+    for version in (PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1):
+        envelope = StreamEnvelope(protocol=version, run_id="r", request_ordinal=1, event_ordinal=0, kind="part_delta")
+        frame = f"event: part_delta\ndata: {envelope.model_dump_json()}\n"
+        with pytest.raises(DaemonError, match=f"protocol {version}"):
+            _parse_frame(frame)
+
+
+def test_client_ignores_unknown_fields_in_an_sse_frame() -> None:
+    payload = {
+        "protocol": PROTOCOL_VERSION,
+        "run_id": "r",
+        "request_ordinal": 1,
+        "event_ordinal": 0,
+        "kind": "part_delta",
+        "future_field": {"a": 1},
+    }
+    envelope = _parse_frame(f"event: part_delta\ndata: {json.dumps(payload)}\n")
+    assert envelope == StreamEnvelope(run_id="r", request_ordinal=1, event_ordinal=0, kind="part_delta")
 
 
 async def test_events_published_before_subscription_are_dropped() -> None:

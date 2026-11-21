@@ -4,6 +4,19 @@ Pydantic models, versioned from the start. A run request is self-contained
 except for history: the client names the workspace, the thread, the resolved
 agent spec, the model string, the output schema, and the prompt. The daemon
 never reads the client's cwd and never reads a repository's config.
+
+Compatibility rule:
+
+- An additive change gets no version bump. Examples: a new optional request
+  field, a new response field, a new event kind, a new non-final frame, a new
+  status value, a new endpoint. The daemon lists each additive request feature
+  in the health ``capabilities`` (``CAPABILITIES``). A client sends a new
+  optional request field only when the daemon lists its capability.
+- A breaking change bumps ``PROTOCOL_VERSION``. Examples: a removed or renamed
+  field, a changed meaning, a new required field. The client rejects a daemon
+  with another version.
+- Clients ignore unknown response fields (``ResponseModel``). The daemon
+  rejects unknown request fields with 422 (``RequestModel``).
 """
 
 from __future__ import annotations
@@ -13,14 +26,29 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
+
+# The features the daemon lists in the health response. Append a name here
+# when a change adds an optional request feature without a version bump.
+CAPABILITIES: tuple[str, ...] = ("cancel",)
 
 
-class _Model(BaseModel):
+class RequestModel(BaseModel):
+    """Base for a body the daemon receives. It rejects unknown fields."""
+
     model_config = ConfigDict(extra="forbid")
 
 
-class TurnRequest(_Model):
+class ResponseModel(BaseModel):
+    """Base for a payload the client parses. It ignores unknown fields.
+
+    A newer daemon can add a field without a version bump.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class TurnRequest(RequestModel):
     """One turn. History is loaded by the daemon from ``thread_id``."""
 
     workspace: str
@@ -35,7 +63,7 @@ class TurnRequest(_Model):
     max_transport_retries: int | None = Field(default=None, ge=0)
 
 
-class RunMetadata(_Model):
+class RunMetadata(ResponseModel):
     """Non-secret retry facts for one run."""
 
     requested_max_transport_retries: int | None = None
@@ -45,7 +73,7 @@ class RunMetadata(_Model):
     physical_model_request_count: int | None = None
 
 
-class RunError(_Model):
+class RunError(ResponseModel):
     """Why a run ended without a result.
 
     ``reason`` is ``exception``, ``cancel_requested``,
@@ -58,7 +86,7 @@ class RunError(_Model):
     message: str | None = None
 
 
-class TurnResponse(_Model):
+class TurnResponse(ResponseModel):
     """The recorded outcome of one turn."""
 
     run_id: str
@@ -70,7 +98,7 @@ class TurnResponse(_Model):
     run_metadata: RunMetadata = Field(default_factory=RunMetadata)
 
 
-class StreamEnvelope(_Model):
+class StreamEnvelope(ResponseModel):
     """One SSE frame.
 
     DBOS may re-execute a step after a crash, so events can repeat. Subscribers
@@ -88,17 +116,17 @@ class StreamEnvelope(_Model):
     final: bool = False
 
 
-class NewThreadRequest(_Model):
+class NewThreadRequest(RequestModel):
     workspace: str
     name: str | None = None
 
 
-class ThreadRef(_Model):
+class ThreadRef(RequestModel):
     workspace: str
     name: str
 
 
-class ThreadInfo(_Model):
+class ThreadInfo(ResponseModel):
     id: str
     workspace: str
     name: str
@@ -108,11 +136,11 @@ class ThreadInfo(_Model):
     runs: int = 0
 
 
-class ThreadList(_Model):
+class ThreadList(ResponseModel):
     threads: list[ThreadInfo] = Field(default_factory=list)
 
 
-class RunInfo(_Model):
+class RunInfo(ResponseModel):
     id: str
     thread_id: str
     workspace: str
@@ -129,38 +157,38 @@ class RunInfo(_Model):
     updated_at: datetime
 
 
-class ThreadView(_Model):
+class ThreadView(ResponseModel):
     thread: ThreadInfo
     runs: list[RunInfo] = Field(default_factory=list)
     messages: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class StatusRequest(_Model):
+class StatusRequest(RequestModel):
     workspace: str
     thread_id: str | None = None
     name: str | None = None
 
 
-class ResumeRequest(_Model):
+class ResumeRequest(RequestModel):
     workspace: str
     run_id: str
 
 
-class ResumeResponse(_Model):
+class ResumeResponse(ResponseModel):
     run_id: str
 
 
-class CancelRequest(_Model):
+class CancelRequest(RequestModel):
     workspace: str
 
 
-class CancelResponse(_Model):
+class CancelResponse(ResponseModel):
     run_id: str
     status: str
     cancelled: bool
 
 
-class UnresolvedEffect(_Model):
+class UnresolvedEffect(ResponseModel):
     run_id: str
     tool_call_id: str
     tool_name: str
@@ -169,7 +197,7 @@ class UnresolvedEffect(_Model):
     note: str = "unknown_after_crash"
 
 
-class StatusView(_Model):
+class StatusView(ResponseModel):
     thread: ThreadInfo | None = None
     latest_run: RunInfo | None = None
     unresolved_effects: list[UnresolvedEffect] = Field(default_factory=list)
@@ -179,17 +207,20 @@ class StatusView(_Model):
     message_bytes: int = 0
 
 
-class ErrorResponse(_Model):
+class ErrorResponse(ResponseModel):
     error: str
     detail: str | None = None
 
 
 __all__ = [
+    "CAPABILITIES",
     "PROTOCOL_VERSION",
     "ErrorResponse",
     "CancelRequest",
     "CancelResponse",
     "NewThreadRequest",
+    "RequestModel",
+    "ResponseModel",
     "RunInfo",
     "RunMetadata",
     "ResumeRequest",

@@ -47,6 +47,7 @@ files, credentials, keys, or database dumps.
 
 - Keep the public command behavior and exit codes stable. Exit code `0` is ok,
   `1` means act on findings, and `2` means the command could not run.
+- An additive protocol change gets no version bump; a breaking change bumps `PROTOCOL_VERSION`. Clients ignore unknown response fields, the daemon rejects unknown request fields, and a new optional request feature gets a health capability. See `docs/reference.md`.
 - The daemon is the only Postgres client. CLI reads and writes go through the
   Unix socket.
 - The canonical run id is the DBOS workflow id, the pydantic-ai run id, the

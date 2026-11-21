@@ -21,7 +21,7 @@ from typing import Any
 from dbos import DBOS, DBOSConfig
 from dbos._error import DBOSAwaitedWorkflowCancelledError
 from inferference import InferferenceClient
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.messages import AgentStreamEvent
 
 from agentman import __version__
@@ -33,11 +33,13 @@ from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
 from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_RUNNING, RUN_TERMINAL, Run, Store
 from agentman.protocol import (
+    CAPABILITIES,
     PROTOCOL_VERSION,
     CancelRequest,
     CancelResponse,
     ErrorResponse,
     NewThreadRequest,
+    RequestModel,
     ResumeRequest,
     ResumeResponse,
     RunError,
@@ -205,21 +207,27 @@ class AgentmanApp:
             body = await _read_body(receive)
             await self._route(method, path, query, body, receive, send)
         except _HttpError as error:
-            await _send_json(send, error.status, ErrorResponse(error=error.message).model_dump(mode="json"))
+            response = ErrorResponse(error=error.message, detail=error.detail)
+            await _send_json(send, error.status, response.model_dump(mode="json"))
 
     async def _route(self, method: str, path: str, query: dict[str, str], body: bytes, receive: Any, send: Any) -> None:
         if method == "GET" and path == "/v1/health":
             await _send_json(
                 send,
                 200,
-                {"status": "ok", "version": __version__, "protocol": PROTOCOL_VERSION, "capabilities": ["cancel"]},
+                {
+                    "status": "ok",
+                    "version": __version__,
+                    "protocol": PROTOCOL_VERSION,
+                    "capabilities": list(CAPABILITIES),
+                },
             )
             return
         if method == "POST" and path == "/v1/turns":
             await self._handle_turn(body, receive, send)
             return
         if method == "POST" and path == "/v1/threads":
-            request = NewThreadRequest.model_validate_json(body)
+            request = _parse_body(NewThreadRequest, body)
             thread = await self._store().create_thread(workspace=request.workspace, name=request.name)
             await _send_json(send, 200, (await thread_info(self._store(), thread)).model_dump(mode="json"))
             return
@@ -230,7 +238,7 @@ class AgentmanApp:
             await _send_json(send, 200, ThreadList(threads=infos).model_dump(mode="json"))
             return
         if method == "POST" and path == "/v1/threads/resolve":
-            request = ThreadRef.model_validate_json(body)
+            request = _parse_body(ThreadRef, body)
             thread = await self._store().resolve_thread_name(workspace=request.workspace, name=request.name)
             if thread is None:
                 raise _HttpError(404, f"no thread named {request.name!r} in {request.workspace}")
@@ -267,7 +275,7 @@ class AgentmanApp:
             run_id = path[len(cancel_prefix) : -len(cancel_suffix)]
             if not run_id or "/" in run_id:
                 raise _HttpError(404, f"no route for {method} {path}")
-            request = CancelRequest.model_validate_json(body)
+            request = _parse_body(CancelRequest, body)
             result = await self.cancel_run(run_id, workspace=request.workspace, reason="cancel_requested")
             await _send_json(send, 200, CancelResponse.model_validate(result).model_dump(mode="json"))
             return
@@ -280,7 +288,7 @@ class AgentmanApp:
         raise _HttpError(404, f"no route for {method} {path}")
 
     async def _handle_turn(self, body: bytes, receive: Any, send: Any) -> None:
-        request = TurnRequest.model_validate_json(body)
+        request = _parse_body(TurnRequest, body)
         store = self._store()
         thread = await store.get_thread(request.thread_id)
         if thread is None:
@@ -503,7 +511,7 @@ class AgentmanApp:
         return f"{MODEL_PREFIX}{resolved}", self.router_url, model_info.n_ctx
 
     async def _handle_status(self, body: bytes, send: Any) -> None:
-        request = StatusRequest.model_validate_json(body)
+        request = _parse_body(StatusRequest, body)
         if self.journal is None:
             raise _HttpError(503, "the daemon is not started")
         view = await compose_status(
@@ -516,7 +524,7 @@ class AgentmanApp:
         await _send_json(send, 200, view.model_dump(mode="json"))
 
     async def _handle_resume(self, body: bytes, send: Any) -> None:
-        request = ResumeRequest.model_validate_json(body)
+        request = _parse_body(ResumeRequest, body)
         run = await self._store().get_run(request.run_id)
         if run is None:
             raise _HttpError(409, f"cannot resume {request.run_id}: not an agentman run")
@@ -598,10 +606,23 @@ async def _drain(queue: asyncio.Queue[StreamEnvelope | None], send: Any) -> None
 
 
 class _HttpError(Exception):
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, detail: str | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.detail = detail
+
+
+def _parse_body[M: RequestModel](model: type[M], body: bytes) -> M:
+    """Validate a request body. Raise a 422 error for an unknown field, a wrong type, or bad JSON."""
+    try:
+        return model.model_validate_json(body)
+    except ValidationError as error:
+        problems = error.errors(include_url=False, include_input=False, include_context=False)
+        detail = "; ".join(
+            f"{'.'.join(str(part) for part in item['loc']) or 'body'}: {item['msg']}" for item in problems
+        )
+        raise _HttpError(422, "invalid request body", detail) from error
 
 
 async def _read_body(receive: Any) -> bytes:

@@ -22,7 +22,7 @@ import agentman.daemon as daemon
 from agentman.config import Config, Value
 from agentman.daemon import AgentmanApp, _HttpError
 from agentman.persistence.store import RUN_TERMINAL, Run
-from agentman.protocol import TurnRequest
+from agentman.protocol import CAPABILITIES, PROTOCOL_VERSION, ErrorResponse, TurnRequest
 
 
 def _app() -> AgentmanApp:
@@ -619,7 +619,59 @@ def test_health_lists_cancel_capability() -> None:
 
     asyncio.run(exercise())
     payload = json.loads(sent[-1]["body"])
-    assert payload["capabilities"] == ["cancel"]
+    assert payload["capabilities"] == list(CAPABILITIES)
+    assert "cancel" in payload["capabilities"]
+    assert payload["protocol"] == PROTOCOL_VERSION
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/v1/turns", {"workspace": "/repo", "thread_id": "t", "model": "m", "prompt": "p", "unknown": 1}),
+        ("/v1/turns", {"workspace": "/repo", "thread_id": "t", "model": "m", "prompt": 7}),
+        ("/v1/turns", {"workspace": "/repo"}),
+        ("/v1/threads", {"workspace": "/repo", "unknown": 1}),
+        ("/v1/threads/resolve", {"workspace": "/repo", "name": 3}),
+        ("/v1/status", {"workspace": "/repo", "unknown": 1}),
+        ("/v1/resume", {"workspace": "/repo", "run_id": "r", "unknown": 1}),
+        ("/v1/runs/run-1/cancel", {"workspace": "/repo", "unknown": 1}),
+    ],
+)
+def test_invalid_request_bodies_return_422_with_an_error_response(path: str, body: dict[str, Any]) -> None:
+    app = _app()
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._http({"method": "POST", "path": path, "query_string": b""}, receive, send)
+
+    asyncio.run(exercise())
+    assert sent[0]["status"] == 422
+    error = ErrorResponse.model_validate_json(sent[1]["body"])
+    assert error.error == "invalid request body"
+    assert error.detail
+
+
+def test_a_request_body_that_is_not_json_returns_422() -> None:
+    app = _app()
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b"not json", "more_body": False}
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._http({"method": "POST", "path": "/v1/turns", "query_string": b""}, receive, send)
+
+    asyncio.run(exercise())
+    assert sent[0]["status"] == 422
 
 
 @pytest.mark.parametrize(

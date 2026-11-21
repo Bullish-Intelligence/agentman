@@ -220,12 +220,8 @@ and the model result may simply not satisfy the requested type.
 ## Unix-socket HTTP API
 
 The client uses HTTP over the configured Unix socket. The protocol version is
-`3`. `agentman version` prints both the package version and protocol version;
+`4`. `agentman version` prints both the package version and protocol version;
 `GET /v1/health` reports the same values. The daemon currently exposes:
-
-Protocol version 3 changes the request, response, and run record shapes.
-Protocol 2 clients and daemons are incompatible because the models reject extra
-fields. Upgrade the client and daemon together.
 
 | Method and path | Request | Response |
 | --- | --- | --- |
@@ -240,6 +236,24 @@ fields. Upgrade the client and daemon together.
 | `POST /v1/resume` | workspace and run id | `ResumeResponse` |
 | `POST /v1/runs/<id>/cancel` | workspace | `CancelResponse` |
 
+### Compatibility rule
+
+- An additive change gets no version bump. Examples: a new optional request
+  field, a new response field, a new event kind, a new non-final frame, a new
+  status value, a new endpoint.
+- The daemon lists each additive request feature in the `capabilities` list of
+  `GET /v1/health`. A client sends a new optional request field only when the
+  daemon lists its capability. `Client.capabilities()` returns the list.
+- A breaking change bumps the protocol version. Examples: a removed or renamed
+  field, a changed meaning, a new required field. The client rejects a daemon
+  with another version.
+- Clients ignore unknown response fields. The daemon rejects unknown request
+  fields, and request fields of the wrong type, with `422` and an
+  `ErrorResponse` body.
+
+Protocol 4 sets this rule. Protocol 3 clients and daemons are incompatible with
+protocol 4. Upgrade the client and daemon together once.
+
 The cancel route answers `404` for an unknown run. It answers `409` for a run
 in another workspace, and for a run that DBOS could not cancel.
 
@@ -247,9 +261,7 @@ in another workspace, and for a run that DBOS could not cancel.
 `cancelled`), the usage known so far, and `error`. `error` is null unless the
 run ended without a result. Then it names the `reason` (`exception`,
 `cancel_requested`, `client_disconnected`, or `workflow_cancelled`) and the
-exception `type` and `message` when one exists. These two fields are additive
-within protocol 3. An older agentman client rejects them, so upgrade the client
-and daemon together.
+exception `type` and `message` when one exists.
 
 Turn history is not sent as a `messages` field. The daemon loads it by thread
 id from the journal. `TurnRequest.max_transport_retries` is optional and must

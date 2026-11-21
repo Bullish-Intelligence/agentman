@@ -9,7 +9,7 @@ from contextlib import aclosing
 import httpx
 
 from agentman.client import Client, TurnStreamError
-from agentman.protocol import StreamEnvelope, TurnRequest, TurnResponse
+from agentman.protocol import RunInfo, StatusView, StreamEnvelope, TurnRequest, TurnResponse
 
 
 def test_stream_turns_preserves_input_order_and_bounds_in_flight_requests() -> None:
@@ -198,3 +198,52 @@ def test_stream_turns_closes_the_stream_after_a_final_turn_error() -> None:
         assert closed == ["raw"]
 
     asyncio.run(scenario())
+
+
+_RUN_PAYLOAD = {
+    "id": "run-1",
+    "thread_id": "thread-1",
+    "workspace": "/repo",
+    "agent": "reviewer",
+    "model": "mock:model",
+    "status": "running",
+    "prompt": "review",
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z",
+}
+
+
+def test_client_ignores_unknown_fields_in_a_run_info_payload() -> None:
+    payload = {**_RUN_PAYLOAD, "future_field": 1, "run_metadata": {"future_field": True}, "error": None}
+
+    class FakeClient(Client):
+        async def _get(self, path: str, params: dict[str, str] | None = None) -> object:
+            return payload
+
+    client = FakeClient.__new__(FakeClient)
+    info = asyncio.run(client.get_run("run-1"))
+
+    assert info == RunInfo.model_validate(_RUN_PAYLOAD)
+
+
+def test_client_ignores_unknown_fields_in_a_status_view_payload() -> None:
+    payload = {
+        "future_field": "x",
+        "latest_run": {**_RUN_PAYLOAD, "future_field": 1},
+        "unresolved_effects": [
+            {
+                "run_id": "run-1",
+                "tool_call_id": "call-1",
+                "tool_name": "write",
+                "status": "started",
+                "started_at": "2026-01-01T00:00:00Z",
+                "future_field": 1,
+            }
+        ],
+    }
+
+    view = StatusView.model_validate(payload)
+
+    assert view.latest_run is not None
+    assert view.latest_run.id == "run-1"
+    assert view.unresolved_effects[0].tool_name == "write"
