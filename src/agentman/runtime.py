@@ -46,7 +46,14 @@ from agentman.model import (
     router_api_key,
 )
 from agentman.model import PREFIX as MODEL_PREFIX
-from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_FAILED, RUN_TERMINAL
+from agentman.persistence.store import (
+    RUN_CANCEL_REQUESTED,
+    RUN_CANCELLED,
+    RUN_COMPLETED,
+    RUN_FAILED,
+    RUN_RUNNING,
+    RUN_TERMINAL,
+)
 from agentman.protocol import RunError, RunMetadata
 
 logger = logging.getLogger(__name__)
@@ -397,10 +404,14 @@ async def _record_cancel(
       touches the thread.
     - A ``cancelled`` row keeps its reason. This function adds the usage and
       the metadata that the first writer did not know.
+    - A ``cancel_requested`` row keeps its status. The daemon is stopping the
+      shell processes of the run, and it writes ``cancelled`` after they are
+      gone. This function adds the usage and the metadata.
     """
     try:
         won = await product_store.finish_run(
             run_id,
+            only_from=frozenset({RUN_RUNNING}),
             status=RUN_CANCELLED,
             usage=usage,
             run_metadata=metadata,
@@ -413,7 +424,7 @@ async def _record_cancel(
             return
         if run.status == RUN_COMPLETED:
             await product_store.touch_thread(run.thread_id)
-        elif run.status == RUN_CANCELLED:
+        elif run.status in {RUN_CANCELLED, RUN_CANCEL_REQUESTED}:
             await product_store.update_run(run_id, usage=usage, run_metadata=metadata)
     except Exception:
         logger.exception("could not record run %s after DBOS cancellation", run_id)

@@ -205,6 +205,15 @@ map, waits for the workflow start, and cancels the DBOS workflow. If the row
 is still absent, the daemon writes it with status `cancelled` and reason
 `cancel_requested`.
 
+The daemon also keeps a map of the shell commands of each run
+(`run_id -> {tool_call_id: pid}`, in `processes.py`). The event handler fills it.
+It adds a command at `shell.command_started`. It drops the command at
+`shell.command_finished` only when `exit_code` is set. The harness also emits
+`command_finished` when the tool stops waiting for a command that still runs, as
+after a timeout or in background mode. The `exit_code` is then `None`, and the
+map keeps the command. The daemon drops the entry of a run when its stream ends.
+A lock guards the map, because the handler can run on a workflow thread.
+
 Streaming is therefore a presentation path with replay tolerance, not the
 source of truth for history. On success the
 daemon emits a final `turn_result` frame after draining live events. On
@@ -222,25 +231,64 @@ preemptible. The code sets `preemptible` only in the `model` step configuration.
 
 A `Coder` tool does not run as a DBOS step. pydantic-ai wraps only MCP and
 dynamic toolsets, so a `Coder` function tool runs inline in the workflow
-coroutine. A cancel does not stop it. The harness records the start and the end
-of each tool call as DBOS steps (`record_tool_effect`, `finish_tool_effect`).
-DBOS refuses to start a step in a cancelled workflow.
+coroutine. DBOS cannot stop it. The daemon stops the shell process itself. The
+harness records the start and the end of each tool call as DBOS steps
+(`record_tool_effect`, `finish_tool_effect`). DBOS refuses to start a step in a
+cancelled workflow.
 
-When a cancel arrives during a `Coder` tool call:
+The shell tool starts each command in its own session. The `pid` of the
+`shell.command_started` event is the session leader, so it is also the process
+group id. `os.killpg(pid, ...)` reaches every child of the command. The harness
+has no public stop call.
 
-- The tool runs to its end. It can still change the workspace.
-- The daemon writes the run row `cancelled` as soon as DBOS accepts the cancel.
-  It does not wait for the tool.
-- `finish_tool_effect` raises, so the effect record stays `started`.
-  `agentman status` lists it as an unresolved effect.
-- The final turn frame arrives after the tool returns.
+A cancel (`cancel_run`) runs these steps in order:
 
-The roadmap lists the open work for this case.
+1. Write the status `cancel_requested` on the run row, with the reason. The
+   status is not final. If DBOS then refuses the cancel, the daemon moves the
+   row back to `running`.
+2. Ask DBOS to cancel the workflow. DBOS then refuses the next step.
+3. Send SIGTERM to each process group that the run started and did not finish.
+   Poll until each group is gone. After the grace time (2 seconds,
+   `TOOL_STOP_GRACE_SECONDS`), send SIGKILL to each group that remains, and
+   poll again for up to 2 seconds.
+4. Mark the effect record of each stopped command `failed`, with the summary
+   `stopped by cancel`. The harness cannot do it, because DBOS refuses the
+   step.
+5. Write `cancelled`.
+
+The POST waits for these steps before it answers. While the daemon works,
+`GET /v1/runs/<id>` returns `cancel_requested`. A client disconnect runs the
+same steps, with the reason `client_disconnected`.
+
+A group counts as gone when it has no member, or only zombie members. A zombie
+has exited and stays until its parent reads its status.
+
+The daemon signals only a process group that this run started and that has no
+exit code. It checks that the group still exists before each signal. A command
+that already finished is never signaled.
+
+If a group survives SIGKILL, the run stays `cancel_requested`, the daemon logs
+the error, and the POST answers `cancelled: false` with that status. A second
+cancel tries again.
+
+After the kill, the shell tool returns a normal result with `exit_code: null`.
+The workflow cannot start another step, so it ends cancelled. The workflow
+unwind does not write `cancelled` over `cancel_requested`. It adds only the
+usage and the metadata. The daemon writes `cancelled` after the groups are gone.
+
+The final turn frame goes out after the stop. It is a `turn_error` frame with
+the key `live_tool_processes`: the process ids that still live. An empty list
+tells the client that no tool process runs. A cancelled workflow that DBOS
+cancelled without a daemon cancel has no stop. The list then names the tracked
+groups that still exist.
+
+A daemon restart loses the process map. A cancel after a restart cannot stop a
+shell command that the old daemon started. At start, the daemon settles each
+`cancel_requested` row (see `docs/persistence-and-recovery.md`).
 
 When the cancelled workflow unwinds, the runtime records usage and metadata
 directly through the product store. It cannot use another DBOS step after
-cancellation. The daemon records the terminal status and reason, then sends a
-final `turn_error` frame when the client remains connected.
+cancellation.
 
 ## Module responsibilities
 
@@ -255,6 +303,7 @@ final `turn_error` frame when the client remains connected.
 | `agent.py` | pydantic-ai agent and capability construction |
 | `runtime.py` | DBOS workflow, history loading, run lifecycle, and cache |
 | `daemon.py` | ASGI transport, lifecycle, SSE registry, Postgres wiring and routes |
+| `processes.py` | Map of the shell commands of each run, and the SIGTERM and SIGKILL stop of their process groups |
 | `client.py` | Unix-socket HTTP client, SSE parsing, fan-out collection and deduplication |
 | `render.py` | On-demand Markdown from stored `ModelMessage` JSON |
 | `status.py` | Product status composed with journal facts |

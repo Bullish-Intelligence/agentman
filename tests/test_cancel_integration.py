@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
 import threading
 import time
 from pathlib import Path
@@ -451,7 +452,12 @@ async def _cancel_command_cancels_stream(
                     final = envelope
                     break
             assert final is not None and final.kind == "turn_error"
-            assert final.event == {"error": "turn cancelled", "reason": "cancel_requested", "run_id": run_id}
+            assert final.event == {
+                "error": "turn cancelled",
+                "reason": "cancel_requested",
+                "run_id": run_id,
+                "live_tool_processes": [],
+            }
             connection = await upstream.wait_for_closed(timeout=5)
             run = await store.get_run(run_id)
             assert run is not None and run.status == "cancelled"
@@ -464,3 +470,111 @@ async def _cancel_command_cancels_stream(
             await _join(thread, 10)
             assert not thread.is_alive(), "the daemon did not stop"
             runtime.reset_agent_cache()
+
+
+def test_cancel_stops_a_coder_shell_command_through_the_socket(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(_cancel_stops_shell_command(database_url, tmp_path, monkeypatch))
+
+
+async def _cancel_stops_shell_command(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel ends a running shell command, and the run ends ``cancelled``."""
+    from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+    import agentman.runtime as runtime
+
+    calls = {"n": 0}
+
+    async def stream_fn(messages: Any, info: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            args = {"command": "sh -c 'sleep 30 & wait'; echo late >> note.md"}
+            yield {0: DeltaToolCall(name="shell", json_args=json.dumps(args), tool_call_id="call-1")}
+        else:
+            yield "Done."
+
+    monkeypatch.setattr(runtime, "build_model", lambda *args, **kwargs: FunctionModel(stream_function=stream_fn))
+    runtime.reset_agent_cache()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    socket_path = tmp_path / "agentman-shell.sock"
+    config = Config(
+        agent=Value("live", "cli"),
+        model=Value(None, "cli"),
+        database_url=Value(database_url, "cli"),
+        socket=Value(str(socket_path), "cli"),
+        router_url=Value(None, "cli"),
+    )
+    app = build_app(config)
+    app.tool_stop_grace = 0.5
+    server = uvicorn.Server(uvicorn.Config(app, uds=str(socket_path), log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    for _ in range(200):
+        if server.started:
+            break
+        await asyncio.sleep(0.025)
+    assert server.started, "the daemon did not start"
+
+    engine = create_engine(database_url)
+    store = Store(engine)
+    step_store = PostgresStepStore(engine)
+    client = Client(socket_path)
+    try:
+        thread_info = await client.new_thread(workspace=str(workspace), name="shell-cancel")
+        request = TurnRequest(
+            workspace=str(workspace),
+            thread_id=thread_info.id,
+            agent_spec={"instructions": "run the command"},
+            agent_name="shell-cancel-integration",
+            model="mock:model",
+            prompt="go",
+            tools="coder",
+        )
+        stream = client.stream_turn(request)
+        pid: int | None = None
+        run_id = ""
+        deadline = time.monotonic() + WAIT_TIMEOUT
+        while pid is None:
+            envelope = await asyncio.wait_for(anext(stream), timeout=deadline - time.monotonic())
+            run_id = envelope.run_id
+            if envelope.kind == "capability" and envelope.event.get("kind") == "shell.command_started":
+                pid = envelope.event["pid"]
+        await asyncio.sleep(0.3)
+        os.killpg(pid, 0)  # the command runs
+
+        result = await client.cancel_run(run_id, workspace=str(workspace))
+        assert result.cancelled is True and result.status == "cancelled"
+        with pytest.raises(ProcessLookupError):
+            os.killpg(pid, 0)
+
+        final = None
+        while final is None:
+            envelope = await asyncio.wait_for(anext(stream), timeout=WAIT_TIMEOUT)
+            if envelope.final:
+                final = envelope
+        assert final.kind == "turn_error"
+        assert final.event["live_tool_processes"] == []
+        await asyncio.sleep(0.5)
+        assert not (workspace / "note.md").exists()
+
+        run = await store.get_run(run_id)
+        assert run is not None and run.status == "cancelled"
+        assert run.error is not None and run.error["reason"] == "cancel_requested"
+        effect = await step_store.get_tool_effect(run_id=run_id, tool_call_id="call-1")
+        assert effect is not None and effect.status == "failed"
+        assert await step_store.list_unresolved_tool_effects(run_id=run_id) == []
+    finally:
+        await client.aclose()
+        await engine.dispose()
+        server.should_exit = True
+        await _join(thread, 10)
+        assert not thread.is_alive(), "the daemon did not stop"
+        runtime.reset_agent_cache()

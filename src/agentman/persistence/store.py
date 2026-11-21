@@ -23,9 +23,17 @@ RUN_RUNNING = "running"
 RUN_COMPLETED = "completed"
 RUN_FAILED = "failed"
 RUN_CANCELLED = "cancelled"
+RUN_CANCEL_REQUESTED = "cancel_requested"
 
 RUN_TERMINAL = frozenset({RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED})
 """A run in one of these states never runs again."""
+
+RUN_ACTIVE = frozenset({RUN_RUNNING, RUN_CANCEL_REQUESTED})
+"""A run in one of these states can still reach a final state.
+
+``cancel_requested`` means the daemon asked DBOS to cancel the run and is
+stopping the tool processes of the run. It is not final.
+"""
 
 
 @dataclass(frozen=True)
@@ -193,12 +201,13 @@ class Store:
         async with self._engine.begin() as connection:
             await connection.execute(update(run_table).where(run_table.c.id == run_id).values(**fields))
 
-    async def finish_run(self, run_id: str, **fields: Any) -> bool:
-        """Write the final status of a run only while it is ``running``.
+    async def finish_run(self, run_id: str, *, only_from: frozenset[str] = RUN_ACTIVE, **fields: Any) -> bool:
+        """Write the final status of a run only while it is in a state of ``only_from``.
 
-        The first writer of a final status wins. The check and the write are one
+        By default the run must be ``running`` or ``cancel_requested``. The first
+        writer of a final status wins. The check and the write are one
         statement, so two writers cannot both succeed. Return ``True`` when this
-        call changed the row, and ``False`` when the run was already final or
+        call changed the row, and ``False`` when the run was in another state or
         does not exist.
         """
         if fields.get("status") not in RUN_TERMINAL:
@@ -206,9 +215,42 @@ class Store:
         fields["updated_at"] = datetime.now(UTC)
         async with self._engine.begin() as connection:
             result = await connection.execute(
-                update(run_table).where(run_table.c.id == run_id, run_table.c.status == RUN_RUNNING).values(**fields)
+                update(run_table).where(run_table.c.id == run_id, run_table.c.status.in_(only_from)).values(**fields)
             )
         return result.rowcount > 0
+
+    async def request_cancel(self, run_id: str, *, error: dict[str, Any]) -> bool:
+        """Move a ``running`` run to ``cancel_requested`` and record the reason.
+
+        Return ``True`` when this call changed the row. The check and the write
+        are one statement.
+        """
+        return await self._move(run_id, source=RUN_RUNNING, target=RUN_CANCEL_REQUESTED, error=error)
+
+    async def reopen_run(self, run_id: str) -> bool:
+        """Move a ``cancel_requested`` run back to ``running``, when DBOS refused the cancel."""
+        return await self._move(run_id, source=RUN_CANCEL_REQUESTED, target=RUN_RUNNING, error=None)
+
+    async def _move(self, run_id: str, *, source: str, target: str, error: dict[str, Any] | None) -> bool:
+        values: dict[str, Any] = {"status": target, "error": error, "updated_at": datetime.now(UTC)}
+        async with self._engine.begin() as connection:
+            result = await connection.execute(
+                update(run_table).where(run_table.c.id == run_id, run_table.c.status == source).values(**values)
+            )
+        return result.rowcount > 0
+
+    async def list_runs_by_status(self, status: str) -> list[Run]:
+        async with self._engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        select(run_table).where(run_table.c.status == status).order_by(run_table.c.created_at.asc())
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_run_from_row(row) for row in rows]
 
     async def get_run(self, run_id: str) -> Run | None:
         async with self._engine.connect() as connection:
@@ -263,7 +305,9 @@ def _run_from_row(row: Any) -> Run:
 
 
 __all__ = [
+    "RUN_ACTIVE",
     "RUN_CANCELLED",
+    "RUN_CANCEL_REQUESTED",
     "RUN_COMPLETED",
     "RUN_FAILED",
     "RUN_RUNNING",

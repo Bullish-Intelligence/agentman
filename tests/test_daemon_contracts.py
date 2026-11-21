@@ -23,7 +23,7 @@ from pydantic_ai_harness.step_persistence.recovery import RecoveryInspection
 import agentman.daemon as daemon
 from agentman.config import Config, Value
 from agentman.daemon import AgentmanApp, _HttpError
-from agentman.persistence.store import RUN_TERMINAL, Run
+from agentman.persistence.store import RUN_ACTIVE, RUN_TERMINAL, Run
 from agentman.protocol import CAPABILITIES, PROTOCOL_VERSION, ErrorResponse, StreamEnvelope, TurnRequest
 
 
@@ -89,6 +89,7 @@ class _CancelStore(_Store):
     def __init__(self, run: Run, *, hidden: bool = False) -> None:
         super().__init__(run)
         self.updates: list[dict[str, Any]] = []
+        self.statuses: list[str] = []
         self.hidden = hidden
 
     def reveal(self) -> None:
@@ -104,14 +105,33 @@ class _CancelStore(_Store):
         self.updates.append(dict(fields))
         self.run = replace(self.run, **fields)
 
-    async def finish_run(self, run_id: str, **fields: Any) -> bool:
+    async def finish_run(self, run_id: str, *, only_from: frozenset[str] = RUN_ACTIVE, **fields: Any) -> bool:
         assert self.run is not None and self.run.id == run_id
         assert fields["status"] in RUN_TERMINAL
-        if self.run.status != "running":
+        if self.run.status not in only_from:
             return False
         self.updates.append(dict(fields))
         self.run = replace(self.run, **fields)
         return True
+
+    async def request_cancel(self, run_id: str, *, error: dict[str, Any]) -> bool:
+        assert self.run is not None and self.run.id == run_id
+        if self.run.status != "running":
+            return False
+        self.statuses.append("cancel_requested")
+        self.run = replace(self.run, status="cancel_requested", error=error)
+        return True
+
+    async def reopen_run(self, run_id: str) -> bool:
+        assert self.run is not None and self.run.id == run_id
+        if self.run.status != "cancel_requested":
+            return False
+        self.statuses.append("running")
+        self.run = replace(self.run, status="running", error=None)
+        return True
+
+    async def list_runs_by_status(self, status: str) -> list[Run]:
+        return [self.run] if self.run is not None and self.run.status == status else []
 
 
 def _dbos(

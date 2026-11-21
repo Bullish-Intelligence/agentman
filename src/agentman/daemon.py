@@ -13,6 +13,9 @@ record is authoritative.
 The second is a map of live runs. The turn handler subscribes and adds the run
 before it starts the workflow, so no event is lost. The map lets a cancel find a
 run whose row does not exist yet.
+
+The third is a map of the shell processes that each run started. A cancel stops
+them. A daemon restart loses this map.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from dbos import DBOS, DBOSConfig, SetWorkflowID
@@ -31,6 +35,7 @@ from dbos._error import DBOSAwaitedWorkflowCancelledError
 from inferference import InferferenceClient
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.messages import AgentStreamEvent
+from pydantic_ai_harness.step_persistence import ToolEffectRecord
 from sqlalchemy.exc import IntegrityError
 
 from agentman import __version__
@@ -40,7 +45,23 @@ from agentman.model import ModelResolutionError, require_schema, resolve_capabil
 from agentman.persistence.engine import create_engine
 from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
-from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, RUN_RUNNING, RUN_TERMINAL, Run, Store
+from agentman.persistence.store import (
+    RUN_ACTIVE,
+    RUN_CANCEL_REQUESTED,
+    RUN_CANCELLED,
+    RUN_COMPLETED,
+    RUN_RUNNING,
+    RUN_TERMINAL,
+    Run,
+    Store,
+)
+from agentman.processes import (
+    TOOL_KILL_WAIT_SECONDS,
+    TOOL_STOP_GRACE_SECONDS,
+    ToolProcesses,
+    group_alive,
+    stop_process_groups,
+)
 from agentman.protocol import (
     CAPABILITIES,
     PROTOCOL_VERSION,
@@ -66,6 +87,9 @@ from agentman.status import compose_status, run_info, thread_info, thread_messag
 
 _STREAM_ADAPTER = TypeAdapter(AgentStreamEvent)
 logger = logging.getLogger(__name__)
+
+# The effect summary of a tool that a cancel stopped.
+_STOPPED_BY_CANCEL = "stopped by cancel"
 
 
 # One handler call numbers its events in the low bits. The DBOS step id sits above them.
@@ -143,7 +167,7 @@ class SubscriberRegistry:
                 loop.call_soon_threadsafe(queue.put_nowait, envelope)
 
 
-def make_event_handler(registry: SubscriberRegistry):
+def make_event_handler(registry: SubscriberRegistry, tools: ToolProcesses | None = None):
     """Return the ``event_stream_handler`` that stamps and publishes events.
 
     The request ordinal is ``ctx.run_step``. The event ordinal is one sequence
@@ -157,6 +181,11 @@ def make_event_handler(registry: SubscriberRegistry):
     Step ids start at 1, so these ordinals are 1 or more.
 
     Outside a DBOS step, the registry counts events for the run, from 1.
+
+    With ``tools``, the handler also records the shell commands of the run: a
+    cancel needs their process ids. The handler records an event before it
+    checks for a subscriber, so a run with no listener still has its commands
+    tracked.
     """
 
     async def handler(ctx: Any, events: Any) -> None:
@@ -164,6 +193,8 @@ def make_event_handler(registry: SubscriberRegistry):
         step_id = DBOS.step_id
         index = 0
         async for event in events:
+            if tools is not None and ctx.run_id is not None:
+                tools.observe(ctx.run_id, event)
             if step_id is None:
                 ordinal = registry.next_ordinal(ctx.run_id)
                 if ordinal is None:
@@ -205,6 +236,11 @@ class _LiveRun:
     started: asyncio.Event = field(default_factory=asyncio.Event)
     # Set by ``cancel_run`` before it asks DBOS to cancel.
     cancel_reason: str | None = None
+    # The result of the tool stop of a cancel: the process ids that still live.
+    # A cancel, a disconnect, and the stream share it. The stream waits for it
+    # before it sends the final frame of a cancelled run.
+    stopped: asyncio.Future[list[int]] = field(default_factory=lambda: asyncio.get_running_loop().create_future())
+    stop_started: bool = False
 
 
 class AgentmanApp:
@@ -214,6 +250,10 @@ class AgentmanApp:
         self.config = config
         self.registry = SubscriberRegistry()
         self._live: dict[str, _LiveRun] = {}
+        self.tools = ToolProcesses()
+        # Tests set shorter times. The values are in seconds.
+        self.tool_stop_grace = TOOL_STOP_GRACE_SECONDS
+        self.tool_kill_wait = TOOL_KILL_WAIT_SECONDS
         self.engine: Any = None
         self.store: Store | None = None
         self.step_store: PostgresStepStore | None = None
@@ -242,7 +282,7 @@ class AgentmanApp:
         configure_runtime(
             step_store=self.step_store,
             product_store=self.store,
-            event_stream_handler=make_event_handler(self.registry),
+            event_stream_handler=make_event_handler(self.registry, self.tools),
             router_key_env=self.config.router_key_env.value,
         )
         DBOS(
@@ -253,6 +293,7 @@ class AgentmanApp:
             )
         )
         DBOS.launch()
+        await self._repair_cancel_requests()
 
     async def shutdown(self) -> None:
         if self.engine is not None:
@@ -485,6 +526,8 @@ class AgentmanApp:
             try:
                 result = result_task.result()
             except DBOSAwaitedWorkflowCancelledError:
+                # The final frame waits until the tool processes are gone.
+                live_processes = await self._live_tool_processes(run_id, live)
                 run = await self._read_run_after_cancel(run_id)
                 self.registry.publish(run_id, None)
                 await drain_task
@@ -503,7 +546,12 @@ class AgentmanApp:
                             request_ordinal=-1,
                             event_ordinal=-1,
                             kind="turn_error",
-                            event={"error": "turn cancelled", "reason": reason, "run_id": run_id},
+                            event={
+                                "error": "turn cancelled",
+                                "reason": reason,
+                                "run_id": run_id,
+                                "live_tool_processes": live_processes,
+                            },
                             final=True,
                         ),
                     )
@@ -545,6 +593,7 @@ class AgentmanApp:
         finally:
             live.started.set()
             self._live.pop(run_id, None)
+            self.tools.discard(run_id)
             tasks = [task for task in (result_task, drain_task, disconnect_task) if task is not None]
             for task in tasks:
                 if not task.done():
@@ -562,13 +611,25 @@ class AgentmanApp:
             raise _HttpError(409, f"run {run_id!r} already exists")
 
     async def cancel_run(self, run_id: str, *, workspace: str, reason: str) -> dict[str, Any]:
-        """Cancel a workflow and record the run state after DBOS accepts it.
+        """Cancel a workflow, stop its tool processes, and record the run state.
+
+        The order is:
+
+        1. Write ``cancel_requested`` on the run row.
+        2. Ask DBOS to cancel the workflow. DBOS then refuses the next step.
+        3. Send SIGTERM to each shell process group that the run started and did
+           not finish. After a grace time, send SIGKILL to the groups that remain.
+        4. Write ``cancelled``.
+
+        The call returns after step 4. If a group survives SIGKILL, the row stays
+        ``cancel_requested``, the daemon logs it, and the call returns
+        ``cancelled: false`` with that status.
 
         The first writer of a final status wins and sets the reason. Return
-        ``cancelled: true`` when the run was ``running`` at the start of the
-        request and is ``cancelled`` at the end, even if the workflow unwind
-        wrote the status first. Otherwise return ``cancelled: false`` with the
-        current status.
+        ``cancelled: true`` when the run was ``running`` or ``cancel_requested``
+        at the start of the request and is ``cancelled`` at the end, even if the
+        workflow unwind wrote the status first. Otherwise return
+        ``cancelled: false`` with the current status.
 
         The workflow writes the run row in its first step. A cancel can arrive
         before that. The live-run map then names the run, and the daemon writes
@@ -595,10 +656,33 @@ class AgentmanApp:
                 live.cancel_reason = reason
             # DBOS cannot cancel a workflow that does not exist yet.
             await live.started.wait()
-        await DBOS.cancel_workflow_async(run_id)
-        workflow_status = await DBOS.get_workflow_status_async(run_id)
+        try:
+            return await self._cancel_workflow(run_id, run, live, reason=reason, current=current)
+        finally:
+            self._release_stop(live)
+
+    async def _cancel_workflow(
+        self, run_id: str, run: Run | None, live: _LiveRun | None, *, reason: str, current: str
+    ) -> dict[str, Any]:
+        """Run steps 1 to 4 of ``cancel_run`` for a run that passed the owner check."""
+        store = self._store()
+        requested = await self._request_cancel(run, reason=reason)
+        try:
+            await DBOS.cancel_workflow_async(run_id)
+            workflow_status = await DBOS.get_workflow_status_async(run_id)
+        except BaseException:
+            await self._reopen_run(run_id, requested)
+            raise
         status = workflow_status.status if workflow_status is not None else None
         if status == "CANCELLED":
+            survivors = await self._stop_tools(run_id, live)
+            if survivors:
+                latest = await store.get_run(run_id)
+                return {
+                    "run_id": run_id,
+                    "status": latest.status if latest is not None else RUN_CANCEL_REQUESTED,
+                    "cancelled": False,
+                }
             latest = await self._finish_cancelled(run_id, reason=reason, live=live)
             if latest is not None and latest.status == RUN_CANCELLED:
                 return {"run_id": run_id, "status": RUN_CANCELLED, "cancelled": True}
@@ -610,10 +694,127 @@ class AgentmanApp:
                 "status": latest.status if latest is not None else current,
                 "cancelled": False,
             }
+        await self._reopen_run(run_id, requested)
         raise _HttpError(409, f"run {run_id!r} could not be cancelled")
 
+    async def _request_cancel(self, run: Run | None, *, reason: str) -> bool:
+        """Write ``cancel_requested`` on a ``running`` row. Return ``True`` when this call wrote it.
+
+        A run with no row yet has nothing to write. A run that already says
+        ``cancel_requested`` keeps the reason of the first request.
+        """
+        if run is None or run.status != RUN_RUNNING:
+            return False
+        error = RunError(reason=reason).model_dump(mode="json")
+        return await self._store().request_cancel(run.id, error=error)
+
+    async def _reopen_run(self, run_id: str, requested: bool) -> None:
+        """Undo ``cancel_requested`` when DBOS did not cancel the workflow. Never raise."""
+        if not requested:
+            return
+        try:
+            await self._store().reopen_run(run_id)
+        except Exception:
+            logger.exception("could not move run %s back to running after a refused cancel", run_id)
+
+    async def _stop_tools(self, run_id: str, live: _LiveRun | None) -> list[int]:
+        """Stop the tool processes of a run. Return the process ids that still live.
+
+        The cancel, the disconnect path, and the stream share one stop for each
+        live run. The stop runs as its own task, so a dropped request does not
+        end it half way.
+        """
+        if live is None:
+            return await self._stop_tool_processes(run_id)
+        if live.stopped.done() and live.stopped.result():
+            # An earlier stop left a process alive. A new cancel tries again.
+            live.stopped = asyncio.get_running_loop().create_future()
+            live.stop_started = False
+        if not live.stop_started:
+            live.stop_started = True
+            stopped = live.stopped
+            task = asyncio.create_task(self._stop_tool_processes(run_id))
+            task.add_done_callback(lambda done: _settle(stopped, done))
+        return await asyncio.shield(live.stopped)
+
+    def _release_stop(self, live: _LiveRun | None) -> None:
+        """Release a stream that waits for a stop that will never start."""
+        if live is not None and not live.stop_started and not live.stopped.done():
+            live.stopped.set_result([])
+
+    async def _stop_tool_processes(self, run_id: str) -> list[int]:
+        tracked = self.tools.snapshot(run_id)
+        if not tracked:
+            return []
+        try:
+            return await self._stop_tracked(run_id, tracked)
+        except Exception:
+            logger.exception("could not stop the tool processes of run %s", run_id)
+            return [pid for pid in tracked.values() if group_alive(pid)]
+
+    async def _stop_tracked(self, run_id: str, tracked: dict[str, int]) -> list[int]:
+        # Only a group that exists at this moment is a running tool process. The
+        # tracker drops a command at its exit code, so a finished command is not here.
+        running = {call_id: pid for call_id, pid in tracked.items() if group_alive(pid)}
+        survivors = await stop_process_groups(
+            running.values(), grace=self.tool_stop_grace, kill_wait=self.tool_kill_wait
+        )
+        stopped = {call_id: pid for call_id, pid in running.items() if pid not in survivors}
+        for call_id in stopped:
+            self.tools.remove(run_id, call_id)
+        await self._record_stopped_effects(run_id, stopped)
+        if survivors:
+            logger.error(
+                "run %s: tool process groups %s survived SIGKILL; the run stays cancel_requested",
+                run_id,
+                survivors,
+            )
+        return survivors
+
+    async def _record_stopped_effects(self, run_id: str, stopped: dict[str, int]) -> None:
+        """Mark the effect record of each stopped command ``failed``. Never raise.
+
+        The cancelled workflow cannot run ``finish_tool_effect``, because DBOS
+        refuses the step. Without this write, the record stays ``started`` and
+        ``status`` lists it as unresolved, although the command has exited.
+        """
+        if not stopped or self.step_store is None:
+            return
+        for call_id in stopped:
+            try:
+                prior = await self.step_store.get_tool_effect(run_id=run_id, tool_call_id=call_id)
+                if prior is None or prior.status != "started":
+                    continue
+                await self.step_store.record_tool_effect(
+                    ToolEffectRecord(
+                        tool_call_id=call_id,
+                        tool_name=prior.tool_name,
+                        run_id=run_id,
+                        status="failed",
+                        started_at=prior.started_at,
+                        ended_at=datetime.now(UTC),
+                        idempotency_key=prior.idempotency_key,
+                        effect_summary=prior.effect_summary or _STOPPED_BY_CANCEL,
+                    )
+                )
+            except Exception:
+                logger.exception("could not record the stopped tool %s of run %s", call_id, run_id)
+
+    async def _live_tool_processes(self, run_id: str, live: _LiveRun) -> list[int]:
+        """Wait for the tool stop of a cancel. Return the process ids that still live.
+
+        A workflow that DBOS cancelled without a daemon cancel has no stop to
+        wait for. The result then lists the tracked groups that still exist.
+        """
+        if live.cancel_reason is not None:
+            await asyncio.shield(live.stopped)
+        return [pid for pid in self.tools.snapshot(run_id).values() if group_alive(pid)]
+
     async def _finish_cancelled(self, run_id: str, *, reason: str, live: _LiveRun | None = None) -> Run | None:
-        """Write ``cancelled`` if the run is still ``running``; return the row after the write.
+        """Write ``cancelled`` if the run is still active; return the row after the write.
+
+        A ``cancel_requested`` row holds the reason of the first request. That
+        reason wins over ``reason``, so concurrent cancels agree.
 
         ``live`` is the live-run record. With it, the function creates a
         ``cancelled`` row when the run has none. This happens when DBOS cancelled
@@ -621,6 +822,9 @@ class AgentmanApp:
         """
         store = self._store()
         usage = await usage_so_far(self.step_store, run_id) if self.step_store is not None else None
+        before = await store.get_run(run_id)
+        if before is not None and before.status == RUN_CANCEL_REQUESTED and before.error is not None:
+            reason = before.error.get("reason") or reason
         error = RunError(reason=reason).model_dump(mode="json")
         won = await store.finish_run(run_id, status=RUN_CANCELLED, usage=usage, error=error)
         latest = await store.get_run(run_id)
@@ -649,17 +853,33 @@ class AgentmanApp:
         """Cancel the workflow of a client that left. Never raise.
 
         The run row may not exist yet: the workflow creates it. The DBOS cancel
-        needs no row, so it comes first. The function records the row only if
-        it exists. It returns ``True`` when DBOS accepted the cancel.
+        needs no row, so it does not wait for one. The function writes
+        ``cancel_requested`` first when the row exists, then asks DBOS to cancel,
+        then stops the tool processes, then records ``cancelled``. It returns
+        ``True`` when DBOS accepted the cancel.
         """
+        live = self._live.get(run_id)
+        run: Run | None = None
+        requested = False
+        try:
+            run = await self._store().get_run(run_id)
+            if run is not None and run.workspace != workspace:
+                run = None
+            requested = await self._request_cancel(run, reason="client_disconnected")
+        except Exception:
+            logger.exception("could not mark run %s as cancel_requested after the client disconnected", run_id)
         try:
             await DBOS.cancel_workflow_async(run_id)
         except Exception:
             logger.exception("could not cancel run %s after the client disconnected", run_id)
+            await self._reopen_run(run_id, requested)
             return False
         try:
+            survivors = await self._stop_tools(run_id, live)
             run = await self._store().get_run(run_id)
-            if run is not None and run.workspace == workspace and run.status == RUN_RUNNING:
+            if survivors:
+                return True
+            if run is not None and run.workspace == workspace and run.status in RUN_ACTIVE:
                 await self._finish_cancelled(run_id, reason="client_disconnected")
         except Exception:
             logger.exception("could not record run %s as cancelled after the client disconnected", run_id)
@@ -733,8 +953,10 @@ class AgentmanApp:
         """Refuse to resume a run that DBOS cancelled.
 
         A crash can fall between the DBOS cancel and the row write. Then the row
-        says ``running`` while DBOS says ``CANCELLED``, and DBOS would restart
-        the workflow. This method repairs the row and refuses the resume.
+        says ``running`` or ``cancel_requested`` while DBOS says ``CANCELLED``,
+        and DBOS would restart the workflow. This method repairs the row and
+        refuses the resume. A ``cancel_requested`` row that DBOS has not
+        cancelled is refused later, by ``authorize_resume``.
         """
         if run.status in RUN_TERMINAL:
             return
@@ -743,6 +965,42 @@ class AgentmanApp:
             return
         await self._finish_cancelled(run.id, reason="workflow_cancelled")
         raise ResumeRefused(f"cannot resume {run.id}: the workflow was cancelled")
+
+    async def _repair_cancel_requests(self) -> None:
+        """Settle each ``cancel_requested`` row that a crash left behind. Never raise.
+
+        The status is not final, and only a live daemon moves it on. After a
+        restart no daemon holds the request, so the row would stay for ever.
+        For each such row:
+
+        - If DBOS cancelled the workflow, or has no record of it, record
+          ``cancelled``.
+        - If DBOS still runs the workflow, the crash fell between the row write
+          and the DBOS cancel. Ask DBOS to cancel, then record ``cancelled``.
+        - If the workflow finished, leave the row and log it.
+
+        The restart lost the process map, so this repair cannot stop a shell
+        command that the old daemon started.
+        """
+        try:
+            rows = await self._store().list_runs_by_status(RUN_CANCEL_REQUESTED)
+        except Exception:
+            logger.exception("could not list the runs that wait for a cancel")
+            return
+        for row in rows:
+            try:
+                workflow_status = await DBOS.get_workflow_status_async(row.id)
+                status = workflow_status.status if workflow_status is not None else None
+                if status in {"SUCCESS", "ERROR"}:
+                    logger.warning("run %s says cancel_requested but its workflow ended with %s", row.id, status)
+                    continue
+                if status != "CANCELLED" and status is not None:
+                    await DBOS.cancel_workflow_async(row.id)
+                reason = row.error.get("reason") if row.error is not None else None
+                await self._finish_cancelled(row.id, reason=reason or "workflow_cancelled")
+                logger.info("settled run %s after a restart: cancel_requested -> cancelled", row.id)
+            except Exception:
+                logger.exception("could not settle run %s after a restart", row.id)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -789,6 +1047,18 @@ async def _drain(queue: asyncio.Queue[StreamEnvelope | None], send: Any) -> None
         if envelope is None:
             return
         await _send_sse(send, envelope)
+
+
+def _settle(future: asyncio.Future[list[int]], task: asyncio.Task[list[int]]) -> None:
+    """Copy the result of a stop task to the future that the waiters share."""
+    if future.done():
+        return
+    if task.cancelled():
+        future.set_result([])
+    elif task.exception() is not None:
+        future.set_result([])
+    else:
+        future.set_result(task.result())
 
 
 class _HttpError(Exception):

@@ -51,7 +51,7 @@ Stores one turn’s product metadata:
 - thread and workspace;
 - agent and model labels;
 - prompt;
-- `running`, `completed`, `failed`, or `cancelled` status;
+- `running`, `cancel_requested`, `completed`, `failed`, or `cancelled` status;
 - output JSON and output type;
 - fallback `messages_json`;
 - usage and timestamps;
@@ -74,7 +74,8 @@ stores the usage known so far: the sum of the model responses of this run in
 the latest journal snapshot. A model request that did not complete adds
 nothing, because the server sends usage only in the last stream chunk.
 
-`error` is null for a running or completed run. Otherwise it holds:
+`error` is null for a running or completed run. For a `cancel_requested` run it
+holds the reason of the cancel. Otherwise it holds:
 
 | Field | Value |
 | --- | --- |
@@ -89,12 +90,19 @@ with `?`. If the full `failed` write still fails, the runtime writes the status
 alone, so the run does not stay `running`.
 
 `completed`, `failed`, and `cancelled` are terminal. `resume` refuses a
-terminal run.
+terminal run. It also refuses a `cancel_requested` run.
+
+`cancel_requested` is not terminal. The daemon writes it when a cancel starts.
+The run then moves to `cancelled` after the daemon stopped the tool processes of
+the run. If DBOS refuses the cancel, the daemon moves the row back to `running`.
 
 ### Final status
 
 The first writer of a final status wins. A write to `completed`, `failed`, or
-`cancelled` changes the row only while the status is `running`. The check and
+`cancelled` changes the row only while the status is `running` or
+`cancel_requested`. The one exception is the workflow unwind after a DBOS
+cancel: it writes `cancelled` only over `running`. It leaves `cancel_requested`
+to the daemon, because shell processes of the run can still live. The check and
 the write are one SQL statement, so two writers cannot both succeed. The writer
 that loses keeps the row as it is. It never changes the status, the reason, the
 output, or the usage.
@@ -119,11 +127,31 @@ The races resolve as follows:
   `cancelled: true`.
 - A run that was already final when the request began reports
   `cancelled: false` with its status.
+- If a tool process survives SIGKILL, the run stays `cancel_requested` and
+  `cancel` reports `cancelled: false` with that status.
 
-A disconnect cancels the DBOS workflow first. This needs no run row, because
-the workflow creates the row. The daemon records the row only if it exists. It
-logs every error on this path. The response has started, so the path never
-raises.
+A disconnect cancels the DBOS workflow without waiting for a run row, because
+the workflow creates the row. The daemon writes `cancel_requested`, stops the
+tool processes, and writes `cancelled` only if the row exists. It logs every
+error on this path. The response has started, so the path never raises.
+
+The daemon marks the effect record of each shell command that a cancel stopped
+`failed`, with the summary `stopped by cancel`. The cancelled workflow cannot do
+it, because DBOS refuses the step. `status` then does not list the command as an
+unresolved effect.
+
+A daemon restart loses the map of shell commands. At start, after DBOS launch,
+the daemon settles each `cancel_requested` row, so a crash in the cancel window
+does not leave the row for ever:
+
+- If DBOS cancelled the workflow, or has no record of it, the daemon writes
+  `cancelled` with the reason that the row holds.
+- If DBOS still runs the workflow, the crash fell between the row write and the
+  DBOS cancel. The daemon asks DBOS to cancel, then writes `cancelled`.
+- If the workflow finished, the daemon leaves the row and logs a warning.
+
+This repair cannot stop a shell command that the old daemon started. That
+command can still change the workspace.
 
 If a failure write meets a cancelled workflow, the runtime records the run as
 `cancelled` with reason `workflow_cancelled`. It keeps the original error type
@@ -246,10 +274,12 @@ The recovery path has a deliberately small policy boundary:
 1. Verify that the run id is an agentman run.
 2. Verify that the request workspace matches the workspace stored on the run.
 3. Read the DBOS workflow status. If DBOS cancelled the workflow but the row
-   says `running`, a crash fell between the DBOS cancel and the row write.
-   Record the row as `cancelled` with reason `workflow_cancelled`, and refuse.
-   DBOS itself would restart a cancelled workflow.
-4. Refuse terminal runs: `completed`, `failed`, and `cancelled`.
+   says `running` or `cancel_requested`, a crash fell between the DBOS cancel
+   and the row write. Record the row as `cancelled` with reason
+   `workflow_cancelled` (a `cancel_requested` row keeps its own reason), and
+   refuse. DBOS itself would restart a cancelled workflow.
+4. Refuse terminal runs: `completed`, `failed`, and `cancelled`. Refuse a
+   `cancel_requested` run, because a cancel is in progress.
 5. Refuse a missing workspace.
 6. Ask harness recovery inspection for unresolved effects.
 7. Reconcile known file evidence against the current pre/post image.

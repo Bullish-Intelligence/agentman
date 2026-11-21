@@ -36,6 +36,9 @@ EXIT_FINDING = 1
 EXIT_CONFIG = 2
 EXIT_USAGE = 3
 
+# The run states that `cancel` selects. A `cancel_requested` run can need a second cancel.
+_CANCELLABLE = frozenset({"running", "cancel_requested"})
+
 
 class _UsageExitCommand(TyperCommand):
     """Make Click/Typer argument failures use agentman's exit contract."""
@@ -292,13 +295,13 @@ def cancel(
             elif thread_name is not None:
                 thread = await client.resolve_thread(workspace=context.workspace, name=thread_name)
                 view = await client.get_thread(thread.id)
-                selected = [item.id for item in view.runs if item.status == "running"]
+                selected = [item.id for item in view.runs if item.status in _CANCELLABLE]
             else:
                 threads = await client.list_threads(workspace=context.workspace)
                 selected = []
                 for thread in threads:
                     view = await client.get_thread(thread.id)
-                    selected.extend(item.id for item in view.runs if item.status == "running")
+                    selected.extend(item.id for item in view.runs if item.status in _CANCELLABLE)
 
             if not selected:
                 typer.echo("no running run")
@@ -319,6 +322,9 @@ def cancel(
                     continue
                 if result.cancelled:
                     typer.echo(f"cancelled {selected_run_id}")
+                elif result.status == "cancel_requested":
+                    typer.echo(f"not cancelled {selected_run_id}: a tool process still runs")
+                    finding = True
                 else:
                     typer.echo(f"not cancelled {selected_run_id}: already {result.status}")
                     finding = True

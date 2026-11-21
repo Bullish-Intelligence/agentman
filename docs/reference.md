@@ -49,7 +49,7 @@ neither option, the client sends no metadata. A daemon without the
 | `show` | `[THREAD]` | With no argument, renders the current thread. With an argument, resolves it as a thread name, not an arbitrary id. |
 | `status` | none | Reads the local current-thread pointer and prints status, including the `origin` and `labels` of the latest run when it has them. With no pointer it prints `no current thread` and exits successfully. |
 | `resume` | `RUN_ID [--yes]` | Fetches the run, verifies its workspace, prints status, optionally confirms, and delegates resumption to DBOS. |
-| `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running runs in the named thread. `--all-running` selects running runs in every workspace thread. A selector can pick several runs. The command tries every run, even after an error, and prints each error on stderr. The exit code is `2` if any run failed with an error, else `1` if any run was already final, else `0`. |
+| `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running and `cancel_requested` runs in the named thread. `--all-running` selects running and `cancel_requested` runs in every workspace thread. A cancel waits while the daemon stops the shell commands of the run, up to about 4 seconds. A run whose tool process survives SIGKILL prints `not cancelled <run-id>: a tool process still runs` and counts as a finding. A selector can pick several runs. The command tries every run, even after an error, and prints each error on stderr. The exit code is `2` if any run failed with an error, else `1` if any run was already final, else `0`. |
 | `config` | none | Prints resolved values and provenance, including inferference's resolved router URL when applicable. |
 | `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--run-id ID] [--origin TEXT] [--label TEXT]... [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. `--run-id` sets the run id. The daemon refuses an id that exists, and an older daemon without the `client-run-id` capability makes the command fail. |
 | `pipe` | `[PREAMBLE] [--agent NAME] [--model MODEL] [--max-transport-retries N] [--origin TEXT] [--label TEXT]... [--json] [--each]` | Reads all stdin. Without `--each`, stdin is one turn; with it, each physical line is an independent ordinary run. |
@@ -264,12 +264,22 @@ protocol 4. Upgrade the client and daemon together once.
 The cancel route answers `404` for an unknown run. It answers `409` for a run
 in another workspace, and for a run that DBOS could not cancel. A cancel that
 arrives after `run_started` and before the run row exists still finds the run.
-The daemon cancels the workflow and writes the run row with status `cancelled`
-and reason `cancel_requested`.
+The daemon writes the run row with status `cancel_requested`, cancels the
+workflow, and stops the shell commands of the run. It sends SIGTERM to each
+process group that the run started and did not finish. After a grace time of 2
+seconds, it sends SIGKILL to each group that remains, and waits up to 2 more
+seconds. Then it writes the status `cancelled` and the reason `cancel_requested`.
+The cancel route answers after these steps, so a request can take about 4
+seconds. If a group survives SIGKILL, the run stays `cancel_requested` and the
+route answers `cancelled: false` with `status: "cancel_requested"`. A second
+cancel tries again. A daemon restart loses the list of shell commands, so a
+cancel after a restart cannot stop a command that the old daemon started.
 
-`RunInfo` carries the run status (`running`, `completed`, `failed`, or
-`cancelled`), the usage known so far, and `error`. `error` is null unless the
-run ended without a result. Then it names the `reason` (`exception`,
+`RunInfo` carries the run status (`running`, `cancel_requested`, `completed`,
+`failed`, or `cancelled`), the usage known so far, and `error`.
+`cancel_requested` is not final. It means a cancel is in progress: the daemon is
+stopping the tool processes of the run. `error` is null unless the run ended
+without a result or a cancel is in progress. Then it names the `reason` (`exception`,
 `cancel_requested`, `client_disconnected`, or `workflow_cancelled`) and the
 exception `type` and `message` when one exists.
 
@@ -351,7 +361,11 @@ frame with a generic message. The CLI reports that as a finding (exit code
 `1`); callers should inspect `status` and the durable run record rather than
 treating a failed turn as proof that no work occurred. A cancellation also ends
 with `turn_error`. Its event contains `error: "turn cancelled"`, the cancel
-reason, and the run id. A connected client receives that final frame. The
+reason, the run id, and `live_tool_processes`. `live_tool_processes` is a list
+of the process ids of shell commands that still run. The daemon sends the final
+frame after it stopped the tool processes, so an empty list tells the client that
+no tool process still runs. An old client ignores the key. A connected client
+receives that final frame. The
 daemon records the cancellation reason on the run and closes the model stream.
 A disconnected client receives no more frames. The daemon cancels its workflow
 and removes the subscriber and local wait tasks. A client that closes the

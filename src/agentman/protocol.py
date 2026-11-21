@@ -111,7 +111,7 @@ class RunMetadata(ResponseModel):
 
 
 class RunError(ResponseModel):
-    """Why a run ended without a result.
+    """Why a run ended without a result, or why a cancel is in progress.
 
     ``reason`` is ``exception``, ``cancel_requested``,
     ``client_disconnected``, or ``workflow_cancelled``. ``type`` and

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from agentman.persistence.store import RUN_RUNNING, RUN_TERMINAL, Run, Thread
+from agentman.persistence.store import RUN_ACTIVE, RUN_CANCEL_REQUESTED, RUN_RUNNING, RUN_TERMINAL, Run, Thread
 
 
 class FakeProductStore:
@@ -65,13 +65,32 @@ class FakeProductStore:
             return
         self.runs[run_id] = dataclasses.replace(current, updated_at=datetime.now(UTC), **fields)
 
-    async def finish_run(self, run_id: str, **fields: Any) -> bool:
+    async def finish_run(self, run_id: str, *, only_from: frozenset[str] = RUN_ACTIVE, **fields: Any) -> bool:
         current = self.runs.get(run_id)
         assert fields.get("status") in RUN_TERMINAL
-        if current is None or current.status != RUN_RUNNING:
+        if current is None or current.status not in only_from:
             return False
         self.runs[run_id] = dataclasses.replace(current, updated_at=datetime.now(UTC), **fields)
         return True
+
+    async def request_cancel(self, run_id: str, *, error: dict[str, Any]) -> bool:
+        current = self.runs.get(run_id)
+        if current is None or current.status != RUN_RUNNING:
+            return False
+        self.runs[run_id] = dataclasses.replace(
+            current, updated_at=datetime.now(UTC), status=RUN_CANCEL_REQUESTED, error=error
+        )
+        return True
+
+    async def reopen_run(self, run_id: str) -> bool:
+        current = self.runs.get(run_id)
+        if current is None or current.status != RUN_CANCEL_REQUESTED:
+            return False
+        self.runs[run_id] = dataclasses.replace(current, updated_at=datetime.now(UTC), status=RUN_RUNNING, error=None)
+        return True
+
+    async def list_runs_by_status(self, status: str) -> list[Run]:
+        return [run for run in self.runs.values() if run.status == status]
 
     async def get_run(self, run_id: str) -> Run | None:
         return self.runs.get(run_id)

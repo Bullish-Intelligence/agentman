@@ -269,3 +269,8 @@ Use `--thread NAME` to cancel running turns in one named thread. Use
 selectors try every run. The exit code is `2` if any run failed with an error,
 else `1` if any run was already final, else `0`. A client disconnect also
 cancels its running turn.
+
+A cancel also stops the shell command that the turn runs. The command gets
+SIGTERM, and SIGKILL after 2 seconds. The command waits for this, so `cancel`
+can take about 2 seconds. A run whose tool process survives shows the status
+`cancel_requested`; run `agentman cancel` again.
