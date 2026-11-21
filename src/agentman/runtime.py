@@ -68,6 +68,7 @@ class ProductStore(Protocol):
         model: str,
         prompt: str,
         run_metadata: dict[str, Any],
+        caller_metadata: dict[str, Any] | None = None,
         status: str = "running",
     ) -> Any: ...  # pragma: no cover
 
@@ -98,6 +99,7 @@ class Turn:
     router_url: str | None = None
     n_ctx: int | None = None
     max_transport_retries: int | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -274,6 +276,7 @@ async def _create_run_step(
     model: str,
     prompt: str,
     run_metadata: dict[str, Any] | None = None,
+    caller_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Insert the product run row exactly once, even across recovery."""
     await product_store.create_run(
@@ -284,6 +287,7 @@ async def _create_run_step(
         model=model,
         prompt=prompt,
         run_metadata=run_metadata or {},
+        caller_metadata=caller_metadata or {},
     )
 
 
@@ -513,6 +517,7 @@ async def run_turn(
         model=turn.model,
         prompt=turn.prompt,
         run_metadata=initial_metadata,
+        caller_metadata=turn.metadata or {},
     )
     track_physical_requests = model is None and turn.model.startswith(MODEL_PREFIX)
     request_counter = TransportRequestCounter() if track_physical_requests else None

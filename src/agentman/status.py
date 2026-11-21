@@ -41,6 +41,7 @@ def run_info(run: Run) -> RunInfo:
         output_json=run.output_json,
         output_type=run.output_type,
         run_metadata=RunMetadata.model_validate(run.run_metadata or {}),
+        metadata=run.caller_metadata or {},
         usage=run.usage,
         error=RunError.model_validate(run.error) if run.error is not None else None,
         created_at=run.created_at,

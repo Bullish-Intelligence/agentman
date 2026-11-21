@@ -25,12 +25,16 @@ one, it is the resolved current directory.
 | `agentman pipe --each [PREAMBLE]` | Run one independent turn per stdin line |
 
 `send` and `pipe` accept `--agent NAME`, `--model MODEL`,
-`--max-transport-retries N`, and `--json`.
+`--max-transport-retries N`, `--origin TEXT`, a repeatable `--label TEXT`, and
+`--json`.
 `--json` suppresses live text deltas and prints the validated final result.
 `--max-transport-retries` sets the transport retry limit for one run. Zero
 allows one initial request and no transport retry. The option applies only to
 `inferference:` models. Omit it to keep the provider default.
 `send` also accepts `--run-id ID`. The daemon uses the id as the run id.
+`--origin` and `--label` attach run metadata (see `TurnRequest.metadata`). With
+neither option, the client sends no metadata. A daemon without the
+`run-metadata` capability makes the command fail with exit code `2`.
 
 ## Exact command behavior
 
@@ -43,12 +47,12 @@ allows one initial request and no transport retry. The option applies only to
 | `use` | `NAME` | Selects the most recently updated thread with that name and writes its id locally. |
 | `ls` | none | Lists all threads in the resolved workspace. |
 | `show` | `[THREAD]` | With no argument, renders the current thread. With an argument, resolves it as a thread name, not an arbitrary id. |
-| `status` | none | Reads the local current-thread pointer and prints status. With no pointer it prints `no current thread` and exits successfully. |
+| `status` | none | Reads the local current-thread pointer and prints status, including the `origin` and `labels` of the latest run when it has them. With no pointer it prints `no current thread` and exits successfully. |
 | `resume` | `RUN_ID [--yes]` | Fetches the run, verifies its workspace, prints status, optionally confirms, and delegates resumption to DBOS. |
 | `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running runs in the named thread. `--all-running` selects running runs in every workspace thread. A selector can pick several runs. The command tries every run, even after an error, and prints each error on stderr. The exit code is `2` if any run failed with an error, else `1` if any run was already final, else `0`. |
 | `config` | none | Prints resolved values and provenance, including inferference's resolved router URL when applicable. |
-| `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--run-id ID] [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. `--run-id` sets the run id. The daemon refuses an id that exists, and an older daemon without the `client-run-id` capability makes the command fail. |
-| `pipe` | `[PREAMBLE] [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json] [--each]` | Reads all stdin. Without `--each`, stdin is one turn; with it, each physical line is an independent ordinary run. |
+| `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--run-id ID] [--origin TEXT] [--label TEXT]... [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. `--run-id` sets the run id. The daemon refuses an id that exists, and an older daemon without the `client-run-id` capability makes the command fail. |
+| `pipe` | `[PREAMBLE] [--agent NAME] [--model MODEL] [--max-transport-retries N] [--origin TEXT] [--label TEXT]... [--json] [--each]` | Reads all stdin. Without `--each`, stdin is one turn; with it, each physical line is an independent ordinary run. |
 
 For the pinned OpenAI software development kit (SDK), the omitted local-provider
 default is two retries. The SDK allows at most `N + 1` physical attempts for
@@ -268,6 +272,31 @@ and reason `cancel_requested`.
 run ended without a result. Then it names the `reason` (`exception`,
 `cancel_requested`, `client_disconnected`, or `workflow_cancelled`) and the
 exception `type` and `message` when one exists.
+
+Run metadata lets a caller say who started a run and why.
+`TurnRequest.metadata` is optional. It is a JSON object. Two keys are reserved:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `origin` | string | Who started the run, for example `user` or `devman:inbox` |
+| `labels` | list of strings | Free tags, for example for a filter in a user interface |
+
+Other keys are allowed and have any JSON value. The daemon rejects a request
+with `422`, before it creates a run, when `origin` is not a string, when
+`labels` is not a list of strings, or when the metadata is larger than 8 KiB
+(8192 bytes) of compact JSON. Compact JSON has no space after `,` and `:`. The
+limit is `MAX_METADATA_BYTES` in `protocol.py`.
+
+The daemon stores the value in `agentman.run.caller_metadata`. It never acts on
+it. `RunInfo.metadata` returns the stored object, and it is `{}` for a run
+without metadata. `GET /v1/runs/<id>`, `StatusView.latest_run`, and
+`ThreadView.runs` all carry it. `RunInfo.run_metadata` is a separate field. It
+holds the retry facts and does not hold caller data.
+
+This feature is additive, so the protocol version stays `4`. The daemon lists
+the capability `run-metadata`. `Client.stream_turn` raises a `DaemonError` that
+names the capability when the request has metadata and the daemon does not list
+it. The client does not drop the metadata.
 
 Turn history is not sent as a `messages` field. The daemon loads it by thread
 id from the journal. `TurnRequest.max_transport_retries` is optional and must

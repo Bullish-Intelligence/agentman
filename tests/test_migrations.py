@@ -83,6 +83,9 @@ def test_the_migrations_still_match_the_live_metadata() -> None:
     assert "error JSONB" not in migration_run
     assert "error JSONB" in live_run
     assert "ALTER TABLE agentman.run ADD COLUMN error JSONB" in alterations
+    assert "caller_metadata JSONB" not in migration_run
+    assert "caller_metadata JSONB DEFAULT '{}'::jsonb NOT NULL" in live_run
+    assert "ALTER TABLE agentman.run ADD COLUMN caller_metadata JSONB DEFAULT '{}'::jsonb NOT NULL" in alterations
     migration.remove(migration_run)
     live.remove(live_run)
 

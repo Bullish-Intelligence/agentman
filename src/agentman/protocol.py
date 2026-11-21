@@ -21,19 +21,41 @@ Compatibility rule:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PROTOCOL_VERSION = 4
 
 # The features the daemon lists in the health response. Append a name here
 # when a change adds an optional request feature without a version bump.
-CAPABILITIES: tuple[str, ...] = ("cancel", "client-run-id")
+CAPABILITIES: tuple[str, ...] = ("cancel", "client-run-id", "run-metadata")
 
 # The pattern of a client run id. The run table column holds 64 characters.
 RUN_ID_PATTERN = r"^[A-Za-z0-9._-]{1,64}$"
+
+# The size limit of ``TurnRequest.metadata``, in bytes of compact JSON.
+# Compact means no spaces after ``,`` and ``:``.
+MAX_METADATA_BYTES = 8 * 1024
+
+
+def validate_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    """Check the reserved keys and the size of caller metadata.
+
+    Raise ``ValueError`` on a bad value. The daemon never reads the value.
+    """
+    if "origin" in value and not isinstance(value["origin"], str):
+        raise ValueError("metadata.origin must be a string")
+    if "labels" in value:
+        labels = value["labels"]
+        if not (isinstance(labels, list) and all(isinstance(item, str) for item in labels)):
+            raise ValueError("metadata.labels must be a list of strings")
+    size = len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+    if size > MAX_METADATA_BYTES:
+        raise ValueError(f"metadata is {size} bytes of JSON; the limit is {MAX_METADATA_BYTES}")
+    return value
 
 
 class RequestModel(BaseModel):
@@ -70,6 +92,12 @@ class TurnRequest(RequestModel):
     output_type: str | None = None
     max_transport_retries: int | None = Field(default=None, ge=0)
     run_id: str | None = Field(default=None, pattern=RUN_ID_PATTERN)
+    metadata: dict[str, Any] | None = None
+
+    @field_validator("metadata")
+    @classmethod
+    def _check_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return validate_metadata(value) if value is not None else None
 
 
 class RunMetadata(ResponseModel):
@@ -173,6 +201,7 @@ class RunInfo(ResponseModel):
     output_json: Any = None
     output_type: str | None = None
     run_metadata: RunMetadata = Field(default_factory=RunMetadata)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     usage: dict[str, Any] | None = None
     error: RunError | None = None
     created_at: datetime
@@ -236,6 +265,7 @@ class ErrorResponse(ResponseModel):
 
 __all__ = [
     "CAPABILITIES",
+    "MAX_METADATA_BYTES",
     "PROTOCOL_VERSION",
     "RUN_ID_PATTERN",
     "ErrorResponse",
@@ -259,4 +289,5 @@ __all__ = [
     "TurnRequest",
     "TurnResponse",
     "UnresolvedEffect",
+    "validate_metadata",
 ]

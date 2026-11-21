@@ -65,6 +65,9 @@ class TurnOutcome:
     error: Exception | None = None
 
 
+METADATA_CAPABILITY = "run-metadata"
+
+
 class Client:
     """An async client over the daemon's Unix socket."""
 
@@ -209,6 +212,12 @@ class Client:
         if request.run_id is not None and "client-run-id" not in await self.capabilities():
             raise DaemonError(
                 "the daemon does not support a client run id; upgrade the daemon or send no run_id",
+                status_code=409,
+            )
+        if request.metadata is not None and METADATA_CAPABILITY not in await self.capabilities():
+            raise DaemonError(
+                f"the daemon does not list the {METADATA_CAPABILITY!r} capability, so it cannot store run metadata; "
+                "upgrade the daemon or send the turn without metadata",
                 status_code=409,
             )
         data = request.model_dump(mode="json")

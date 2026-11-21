@@ -54,6 +54,7 @@ class Run:
     updated_at: datetime
     run_metadata: dict[str, Any] = field(default_factory=dict)
     error: dict[str, Any] | None = None
+    caller_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def short_id(identifier: str) -> str:
@@ -144,6 +145,7 @@ class Store:
         model: str,
         prompt: str,
         run_metadata: dict[str, Any] | None = None,
+        caller_metadata: dict[str, Any] | None = None,
         status: str = RUN_RUNNING,
         error: dict[str, Any] | None = None,
     ) -> Run:
@@ -160,6 +162,7 @@ class Store:
                     prompt=prompt,
                     run_metadata=run_metadata or {},
                     error=error,
+                    caller_metadata=caller_metadata or {},
                     created_at=now,
                     updated_at=now,
                 )
@@ -180,6 +183,7 @@ class Store:
             updated_at=now,
             run_metadata=run_metadata or {},
             error=error,
+            caller_metadata=caller_metadata or {},
         )
 
     async def update_run(self, run_id: str, **fields: Any) -> None:
@@ -254,6 +258,7 @@ def _run_from_row(row: Any) -> Run:
         updated_at=row["updated_at"],
         run_metadata=row.get("run_metadata") or {},
         error=row.get("error"),
+        caller_metadata=row.get("caller_metadata") or {},
     )
 
 

@@ -57,6 +57,7 @@ run = Table(
     Column("usage", JSONB, nullable=True),
     Column("run_metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     Column("error", JSONB, nullable=True),
+    Column("caller_metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Index("ix_run_thread_created", "thread_id", "created_at"),

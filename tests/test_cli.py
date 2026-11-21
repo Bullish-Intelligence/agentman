@@ -260,6 +260,7 @@ def test_send_passes_transport_retry_limit(monkeypatch: pytest.MonkeyPatch) -> N
         json_output: object,
         max_transport_retries: int | None,
         run_id: str | None = None,
+        metadata: object = None,
     ) -> None:
         calls.append(max_transport_retries)
         run_ids.append(run_id)
@@ -338,6 +339,7 @@ def test_pipe_without_each_keeps_the_single_turn_path(monkeypatch: pytest.Monkey
         model: object,
         json_output: object,
         max_transport_retries: int | None,
+        metadata: object = None,
     ) -> None:
         calls.append((message, agent, model, json_output, max_transport_retries))
 
@@ -968,3 +970,116 @@ def test_send_closes_the_turn_stream_when_the_loop_body_raises(monkeypatch: pyte
         assert closed
 
     asyncio.run(scenario())
+
+
+def test_status_prints_the_origin_and_labels_of_a_run(capsys) -> None:
+    from datetime import UTC, datetime
+
+    from agentman.protocol import RunInfo, StatusView, ThreadInfo
+
+    now = datetime.now(UTC)
+    view = StatusView(
+        thread=ThreadInfo(
+            id="t" * 32, workspace="/repo", name="topic", created_at=now, updated_at=now, short_id="tttttttt"
+        ),
+        latest_run=RunInfo(
+            id="run-1",
+            thread_id="t" * 32,
+            workspace="/repo",
+            agent="topic",
+            model="openai:slow",
+            status="completed",
+            prompt="p",
+            metadata={"origin": "devman:inbox", "labels": ["a", "b"]},
+            created_at=now,
+            updated_at=now,
+        ),
+    )
+
+    cli._print_status_view(view)
+
+    output = capsys.readouterr().out
+    assert "origin devman:inbox\n" in output
+    assert "labels a, b\n" in output
+
+
+def test_status_omits_origin_and_labels_when_a_run_has_none(capsys) -> None:
+    from datetime import UTC, datetime
+
+    from agentman.protocol import RunInfo, StatusView, ThreadInfo
+
+    now = datetime.now(UTC)
+    view = StatusView(
+        thread=ThreadInfo(
+            id="t" * 32, workspace="/repo", name="topic", created_at=now, updated_at=now, short_id="tttttttt"
+        ),
+        latest_run=RunInfo(
+            id="run-1",
+            thread_id="t" * 32,
+            workspace="/repo",
+            agent="topic",
+            model="openai:slow",
+            status="completed",
+            prompt="p",
+            created_at=now,
+            updated_at=now,
+        ),
+    )
+
+    cli._print_status_view(view)
+
+    output = capsys.readouterr().out
+    assert "origin" not in output
+    assert "labels" not in output
+
+
+def test_send_builds_metadata_from_origin_and_label_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_one_turn(message: str, *, metadata: object = None, **_: object) -> None:
+        calls.append(metadata)
+
+    monkeypatch.setattr(cli, "_one_turn", fake_one_turn)
+    result = CliRunner().invoke(app, ["send", "hello", "--origin", "user", "--label", "a", "--label", "b"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [{"origin": "user", "labels": ["a", "b"]}]
+
+
+def test_send_without_options_sends_no_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_one_turn(message: str, *, metadata: object = None, **_: object) -> None:
+        calls.append(metadata)
+
+    monkeypatch.setattr(cli, "_one_turn", fake_one_turn)
+    result = CliRunner().invoke(app, ["send", "hello"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == [None]
+
+
+def test_pipe_passes_metadata_to_each_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+
+    async def fake_one_turn(message: str, *, metadata: object = None, **_: object) -> None:
+        calls.append(metadata)
+
+    async def fake_fan_out(records: list[str], *, metadata: object = None, **_: object) -> None:
+        calls.append(metadata)
+
+    monkeypatch.setattr(cli, "_one_turn", fake_one_turn)
+    monkeypatch.setattr(cli, "_fan_out", fake_fan_out)
+    single = CliRunner().invoke(app, ["pipe", "--label", "x"], input="payload\n")
+    each = CliRunner().invoke(app, ["pipe", "--each", "--origin", "job"], input="one\n")
+
+    assert single.exit_code == 0, single.output
+    assert each.exit_code == 0, each.output
+    assert calls == [{"labels": ["x"]}, {"origin": "job"}]
+
+
+def test_send_rejects_metadata_above_the_size_limit() -> None:
+    result = CliRunner().invoke(app, ["send", "hello", "--label", "x" * 9000])
+
+    assert result.exit_code == 3
+    assert "limit" in result.output

@@ -14,7 +14,7 @@ from agentman.persistence.inspect import Journal
 from agentman.persistence.step_store import PostgresStepStore
 from agentman.persistence.store import RUN_CANCELLED, RUN_COMPLETED, Store, short_id
 from agentman.persistence.tables import messages, run, runs, snapshot_idempotency_keys, snapshots, thread
-from agentman.status import compose_status
+from agentman.status import compose_status, run_info
 
 pytestmark = pytest.mark.integration
 
@@ -94,6 +94,42 @@ async def test_run_records_agent_and_model_per_run(engine: Any, clean: None) -> 
     }
     runs = await store.list_runs(thread_id=created.id)
     assert [record.id for record in runs] == ["run-1"]
+
+
+async def test_caller_metadata_round_trips_apart_from_run_metadata(engine: Any, clean: None) -> None:
+    store = Store(engine)
+    created = await store.create_thread(workspace="/repo", name="t")
+    metadata = {"origin": "devman:inbox", "labels": ["a", "b"], "ticket": 7}
+    await store.create_run(
+        run_id="run-meta",
+        thread_id=created.id,
+        workspace="/repo",
+        agent="reviewer",
+        model="inferference:gemma",
+        prompt="hello",
+        run_metadata={"requested_max_transport_retries": 1},
+        caller_metadata=metadata,
+    )
+    await store.create_run(
+        run_id="run-plain",
+        thread_id=created.id,
+        workspace="/repo",
+        agent="reviewer",
+        model="inferference:gemma",
+        prompt="hello",
+    )
+
+    with_metadata = await store.get_run("run-meta")
+    without = await store.get_run("run-plain")
+    assert with_metadata is not None
+    assert with_metadata.caller_metadata == metadata
+    assert with_metadata.run_metadata == {"requested_max_transport_retries": 1}
+    assert run_info(with_metadata).metadata == metadata
+    assert without is not None
+    assert without.caller_metadata == {}
+    assert run_info(without).metadata == {}
+    listed = {record.id: record.caller_metadata for record in await store.list_runs(thread_id=created.id)}
+    assert listed == {"run-meta": metadata, "run-plain": {}}
 
 
 async def test_run_error_round_trips_through_store(engine: Any, clean: None) -> None:

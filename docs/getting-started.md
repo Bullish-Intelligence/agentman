@@ -195,6 +195,17 @@ agentman send --run-id review-42 "Review the current working tree."
 The id uses letters, digits, `.`, `_`, and `-`, and has at most 64 characters.
 The daemon refuses an id that a run already uses.
 
+Record who started a run and attach labels:
+
+```sh
+agentman send --origin devman:inbox --label triage --label weekly "Sort this."
+```
+
+`--origin` takes one text value. `--label` can repeat. `agentman status` shows
+both for the latest run. The daemon stores them and never acts on them. Both
+options also work with `pipe`. The daemon must list the `run-metadata`
+capability. Upgrade the daemon when the command reports a missing capability.
+
 Fan out one independent run per input line:
 
 ```sh

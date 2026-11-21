@@ -14,7 +14,7 @@ import sys
 from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Annotated, Any, NoReturn
 
 import httpx
 import typer
@@ -26,7 +26,7 @@ from agentman.client import Client, DaemonError, DaemonNotRunning, TurnStreamErr
 from agentman.config import Config, ConfigError, load_config, provenance
 from agentman.discovery import Directories, global_directory, resolve_directories, resolve_workspace
 from agentman.model import ModelResolutionError, resolve_parallelism, router_api_key
-from agentman.protocol import PROTOCOL_VERSION, TurnRequest, TurnResponse
+from agentman.protocol import PROTOCOL_VERSION, TurnRequest, TurnResponse, validate_metadata
 from agentman.render import render_thread
 from agentman.schema import OutputValidationError, SchemaError, schema_out, validate_output
 from structured_agents import SpecError, discover_specs, load_spec
@@ -372,6 +372,10 @@ def send(
         min=0,
         help="Set the local provider's transport retry limit for this run.",
     ),
+    origin: str | None = typer.Option(None, "--origin", help="Record who started the run, for example `user`."),
+    labels: Annotated[
+        list[str] | None, typer.Option("--label", help="Add a label to the run. Repeat for more.")
+    ] = None,
     json_output: bool = typer.Option(False, "--json", help="print the validated output and suppress the stream"),
     run_id: str | None = typer.Option(
         None,
@@ -380,6 +384,7 @@ def send(
     ),
 ) -> None:
     """One turn."""
+    metadata = _caller_metadata(origin, labels)
     _call(
         lambda: _one_turn(
             message,
@@ -388,6 +393,7 @@ def send(
             json_output=json_output,
             max_transport_retries=max_transport_retries,
             run_id=run_id,
+            metadata=metadata,
         )
     )
 
@@ -404,6 +410,10 @@ def pipe(
         min=0,
         help="Set the local provider's transport retry limit for each run.",
     ),
+    origin: str | None = typer.Option(None, "--origin", help="Record who started the run, for example `user`."),
+    labels: Annotated[
+        list[str] | None, typer.Option("--label", help="Add a label to the run. Repeat for more.")
+    ] = None,
     json_output: bool = typer.Option(False, "--json", help="print the validated output and suppress the stream"),
     each: bool = typer.Option(False, "--each", help="run one independent turn per stdin line"),
 ) -> None:
@@ -418,6 +428,7 @@ def pipe(
         _fail(str(error), EXIT_USAGE)
     if parsed.jobs_seen and not each:
         _fail("-j/--jobs requires --each", EXIT_USAGE)
+    metadata = _caller_metadata(origin, labels)
     text = sys.stdin.read()
     if not each:
         message = f"{parsed.preamble}\n\n{text}" if parsed.preamble else text
@@ -428,6 +439,7 @@ def pipe(
                 model=model,
                 json_output=json_output,
                 max_transport_retries=max_transport_retries,
+                metadata=metadata,
             )
         )
         return
@@ -441,6 +453,7 @@ def pipe(
             model=model,
             json_output=json_output,
             max_transport_retries=max_transport_retries,
+            metadata=metadata,
         )
     )
 
@@ -453,6 +466,7 @@ async def _one_turn(
     json_output: bool,
     max_transport_retries: int | None = None,
     run_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     context = _context(agent=agent, model=model)
     setup = _prepare_turn(context)
@@ -465,6 +479,7 @@ async def _one_turn(
             prompt=message,
             max_transport_retries=max_transport_retries,
             run_id=run_id,
+            metadata=metadata,
         )
         final: TurnResponse | None = None
         stream_error: str | None = None
@@ -509,6 +524,7 @@ async def _fan_out(
     model: str | None,
     json_output: bool,
     max_transport_retries: int | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Submit one ordinary turn request per physical stdin line."""
     if not records:
@@ -531,6 +547,7 @@ async def _fan_out(
                 thread_id=thread_id,
                 prompt=prompt,
                 max_transport_retries=max_transport_retries,
+                metadata=metadata,
             )
             for prompt in prompts
         ]
@@ -612,6 +629,7 @@ def _turn_request(
     prompt: str,
     max_transport_retries: int | None = None,
     run_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> TurnRequest:
     return TurnRequest(
         workspace=setup.context.workspace,
@@ -625,7 +643,23 @@ def _turn_request(
         output_type=setup.output_type,
         max_transport_retries=max_transport_retries,
         run_id=run_id,
+        metadata=metadata,
     )
+
+
+def _caller_metadata(origin: str | None, labels: list[str] | None) -> dict[str, Any] | None:
+    """Build the run metadata from the options. Return ``None`` when none is set."""
+    metadata: dict[str, Any] = {}
+    if origin is not None:
+        metadata["origin"] = origin
+    if labels:
+        metadata["labels"] = list(labels)
+    if not metadata:
+        return None
+    try:
+        return validate_metadata(metadata)
+    except ValueError as error:
+        _fail(str(error), EXIT_USAGE)
 
 
 def _validated_output(final: TurnResponse, setup: _TurnSetup) -> Any:
@@ -740,6 +774,12 @@ def _print_status_view(view: Any) -> None:
         return
     run = view.latest_run
     typer.echo(f"run {run.id}  {run.status}  {run.agent}  {run.model}")
+    origin = run.metadata.get("origin")
+    if origin is not None:
+        typer.echo(f"origin {origin}")
+    labels = run.metadata.get("labels")
+    if labels:
+        typer.echo(f"labels {', '.join(str(label) for label in labels)}")
     metadata = run.run_metadata
     requested = (
         str(metadata.requested_max_transport_retries)

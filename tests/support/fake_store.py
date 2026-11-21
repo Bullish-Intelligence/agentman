@@ -35,6 +35,7 @@ class FakeProductStore:
         model: str,
         prompt: str,
         run_metadata: dict[str, Any] | None = None,
+        caller_metadata: dict[str, Any] | None = None,
         status: str = RUN_RUNNING,
     ) -> Run:
         now = datetime.now(UTC)
@@ -53,6 +54,7 @@ class FakeProductStore:
             created_at=now,
             updated_at=now,
             run_metadata=run_metadata or {},
+            caller_metadata=caller_metadata or {},
         )
         self.runs[run_id] = run
         return run

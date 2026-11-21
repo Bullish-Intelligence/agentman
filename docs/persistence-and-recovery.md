@@ -55,9 +55,15 @@ Stores one turn’s product metadata:
 - output JSON and output type;
 - fallback `messages_json`;
 - usage and timestamps;
-- non-secret run metadata with requested and effective transport retry limits,
-  fallback state, logical turn count, and physical model request count; and
-- `error`, the reason a run ended without a result.
+- non-secret run metadata (`run_metadata`) with requested and effective
+  transport retry limits, fallback state, logical turn count, and physical
+  model request count;
+- `error`, the reason a run ended without a result; and
+- `caller_metadata`, the JSON object that the caller sent in
+  `TurnRequest.metadata`, such as `origin` and `labels`. The column is
+  `NOT NULL` and defaults to `{}`. The daemon writes it once, when it creates
+  the row. It never acts on it. It is separate from the retry facts in
+  `run_metadata`.
 
 The product row is written through DBOS steps so recovery does not attempt a
 second plain insert for the same workflow id. A failure to record `failed` is

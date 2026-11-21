@@ -394,6 +394,7 @@ class AgentmanApp:
             router_url=router_url,
             n_ctx=n_ctx,
             max_transport_retries=request.max_transport_retries,
+            metadata=request.metadata,
         )
         run_id = request.run_id or str(uuid.uuid4())
         # Subscribe before the workflow starts, so no event is lost. The check
