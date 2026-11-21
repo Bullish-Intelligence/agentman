@@ -66,6 +66,7 @@ ordinary runs. Capabilities are pydantic-ai/harness implementation details.
 | Run cancellation | Implemented and tested | Model steps stop on cancel; a cancel stops the running shell command with SIGTERM, then SIGKILL, and marks its effect record `failed`; the run reads `cancel_requested` until then; disconnects cancel the same way |
 | `pipe --each -j N` | Implemented | The bound is per CLI invocation; the daemon remains unscheduled and concurrent |
 | Systemd fd handoff | Implemented in daemon code and tested | The daemon accepts one systemd listening descriptor |
+| Two distributions | Implemented | `agentman-client` (client, protocol, config, discovery, spec loader; no server dependencies) and `agentman` (daemon, CLI) at one version |
 | Machine-wide install and Postgres | Configured and built; current release not active | Installation and activation are outside this repository |
 
 The distinction between implementation and operation matters. For example,

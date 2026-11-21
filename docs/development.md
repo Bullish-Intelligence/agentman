@@ -20,19 +20,109 @@ defines the exit-code convention used by the application.
 version. `GET /v1/health` reports the same pair so operators can compare the
 client and daemon before a request.
 
+## Two distributions
+
+The repository is a uv workspace. It builds two distributions:
+
+| Distribution | Folder | Content |
+| --- | --- | --- |
+| `agentman-client` | `packages/agentman-client/` | `agentman.client`, `agentman.protocol`, `agentman.config`, `agentman.discovery`, `agentman/__init__.py`, and `structured_agents` |
+| `agentman` | repository root | the daemon, runtime, persistence, CLI, and migrations |
+
+`agentman-client` depends on `pydantic`, `pydantic-ai-slim` (no extras),
+`httpx`, and `pyyaml`. It installs none of DBOS, SQLAlchemy, asyncpg, psycopg,
+Alembic, uvicorn, `pydantic-ai-harness`, or `inferference`.
+
+`agentman` depends on `agentman-client` at the same version. Both wheels
+install into one `agentman/` folder. Only the client wheel ships
+`agentman/__init__.py`. That file extends the package path, so
+`agentman.daemon` resolves from the root wheel, and from the root source tree
+in an editable install. Do not add `src/agentman/__init__.py` to the root
+distribution.
+
+A client-only program, such as a web UI, depends on the client alone:
+
+```toml
+[project]
+dependencies = ["agentman-client"]
+
+[tool.uv.sources]
+agentman-client = { git = "https://github.com/Bullish-Intelligence/agentman.git", subdirectory = "packages/agentman-client", tag = "vX.Y.Z" }
+```
+
+A downstream uv2nix build of `agentman` resolves the `agentman-client`
+workspace member from the same `uv.lock`. Build both members from one source
+checkout. Do not look for `agentman-client` in an index.
+
+### Version bump
+
+Both distributions use one version. Change all three places in one commit:
+
+1. `version` in `pyproject.toml`;
+2. `version` in `packages/agentman-client/pyproject.toml` and the
+   `agentman-client==X.Y.Z` pin in `pyproject.toml`;
+3. `__version__` in `packages/agentman-client/src/agentman/__init__.py`.
+
+Then run `uv lock` and commit `uv.lock` in the same change. Add the release to
+`CHANGELOG.md`. `tests/test_versions.py` fails when the versions differ.
+
+### Packaging test
+
+`tests/test_packaging.py` builds both wheels and installs them into clean
+virtual environments. It is slow and may need the network, so it is off by
+default:
+
+```sh
+AGENTMAN_RUN_PACKAGING=1 devenv shell -- uv run pytest tests/test_packaging.py
+```
+
+Set `AGENTMAN_PACKAGING_OFFLINE=1` to install from the uv cache only. The test
+checks three things:
+
+- a venv with only the client wheel holds none of the server packages;
+- in that venv, `Client`, `TurnRequest`, and `load_spec` import, and the tests
+  in `packages/agentman-client/tests/` pass;
+- a venv with both wheels imports `agentman.daemon` and runs `agentman version`.
+
+### Import contracts
+
+import-linter checks both source trees. The contract "the client distribution
+has no server imports" blocks `agentman.client`, `agentman.protocol`,
+`agentman.config`, `agentman.discovery`, and `structured_agents` from
+importing a server module or a server package.
+
+grimp reads the package location before it imports anything. In a development
+checkout, `agentman` has two source folders, so run the checker through the
+helper. It imports `agentman` first:
+
+```sh
+devenv shell -- uv run python tests/support/lint_imports.py
+```
+
+`tests/test_import_contracts.py` runs the helper. It also proves that the client
+contract fails when a client module imports `agentman.daemon`,
+`agentman.runtime`, `agentman.persistence`, `sqlalchemy`, or `dbos`.
+
 ## Repository map
 
 ```text
-src/agentman/
+packages/agentman-client/          the agentman-client distribution
+  pyproject.toml
+  src/agentman/
+    __init__.py          version and package path extension
+    client.py            Unix-socket client and SSE handling
+    protocol.py          versioned socket request/response models
+    config.py            flat configuration and provenance
+    discovery.py         workspace and config directory resolution
+  src/structured_agents/
+    spec.py              provider-neutral spec loader and extensions
+  tests/                 tests that need only the client distribution
+src/agentman/            the agentman distribution (no __init__.py)
   cli.py                 public command surface and exit codes
-  client.py              Unix-socket client and SSE handling
-  config.py              flat configuration and provenance
-  discovery.py           workspace and config directory resolution
   daemon.py              ASGI daemon, routes, DBOS lifecycle, socket serving
   model.py               inferference and pydantic-ai model resolution
   agent.py               AgentSpec → pydantic-ai Agent construction
   runtime.py             DBOS workflow and history loading
-  protocol.py            versioned socket request/response models
   schema.py              repository-interpreter schema/validation bridge
   recovery.py            resume authorization policy
   effects.py             file-effect pre/post hash evidence
@@ -43,8 +133,6 @@ src/agentman/
     store.py             agentman thread/run CRUD
     step_store.py        harness StepStore Postgres adapter
     inspect.py            journal inspection queries
-src/structured_agents/
-  spec.py                provider-neutral spec loader and extensions
 migrations/
   versions/0001_initial.py  frozen product/journal schema
 tests/
@@ -108,11 +196,13 @@ by `AGENTMAN_RUN_INTEGRATION=1`; the live router suite additionally uses
 Run the checks from the repository root:
 
 ```sh
-devenv shell -- ruff check src tests
-devenv shell -- ruff format --check src tests
-devenv shell -- ty check src
+devenv shell -- ruff check src tests packages
+devenv shell -- ruff format --check src tests packages
+devenv shell -- ty check src packages/agentman-client/src
 devenv shell -- pytest
 ```
+
+`pytest` collects `tests/` and `packages/agentman-client/tests/`.
 
 The `devenv.nix` tasks expose the same checks, and import-linter enforces the
 package boundaries.
@@ -146,6 +236,9 @@ Useful focused suites include:
 | `test_crash_windows.py`, `test_recovery_integration.py` | crash-window and resume policy |
 | `test_live_rig.py` | live router capabilities, schema request, and model path |
 | `test_systemd.py` | passed-fd serving behavior |
+| `test_versions.py` | both distributions and `__version__` state one version |
+| `test_import_contracts.py` | the import-linter contracts hold; the client contract catches a server import |
+| `test_packaging.py` | gated; clean-venv install of the client wheel and of both wheels |
 
 The default test run does not prove Postgres recovery or a live model path.
 Always name the gate when reporting evidence.
@@ -194,7 +287,7 @@ Create a release from a verified change on the main branch:
 
 ```sh
 git switch -c release-x-y-z
-# bump the version in pyproject.toml
+# bump the version in both pyproject.toml files and in __version__ (see "Version bump")
 git commit -m "chore: bump version to X.Y.Z"
 # run the checks above
 git switch main

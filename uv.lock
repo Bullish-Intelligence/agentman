@@ -2,11 +2,18 @@ version = 1
 revision = 3
 requires-python = ">=3.13"
 
+[manifest]
+members = [
+    "agentman",
+    "agentman-client",
+]
+
 [[package]]
 name = "agentman"
 version = "0.0.4"
 source = { editable = "." }
 dependencies = [
+    { name = "agentman-client" },
     { name = "alembic" },
     { name = "asyncpg" },
     { name = "dbos" },
@@ -34,6 +41,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agentman-client", editable = "packages/agentman-client" },
     { name = "alembic", specifier = ">=1.13" },
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "dbos", specifier = ">=3.0,<3.1" },
@@ -57,6 +65,25 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
     { name = "ty" },
+]
+
+[[package]]
+name = "agentman-client"
+version = "0.0.4"
+source = { editable = "packages/agentman-client" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-ai-slim" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "pydantic", specifier = ">=2" },
+    { name = "pydantic-ai-slim", specifier = ">=2.41,<3" },
+    { name = "pyyaml" },
 ]
 
 [[package]]

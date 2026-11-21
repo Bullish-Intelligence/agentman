@@ -290,27 +290,41 @@ When the cancelled workflow unwinds, the runtime records usage and metadata
 directly through the product store. It cannot use another DBOS step after
 cancellation.
 
+## Package boundary
+
+The code ships as two distributions in one uv workspace. `agentman-client`
+holds `client.py`, `protocol.py`, `config.py`, `discovery.py`,
+`agentman/__init__.py`, and `structured_agents`. It has no server
+dependencies. `agentman` holds every other module and depends on
+`agentman-client` at the same version. Both share the `agentman` package
+folder. The import-linter contract "the client distribution has no server
+imports" keeps the boundary. See `docs/development.md`.
+
 ## Module responsibilities
 
-| Module | Responsibility |
-| --- | --- |
-| `cli.py` | Typer commands, config/spec resolution, output validation, rendering and exit codes |
-| `config.py` | Flat global/repository config merge and provenance |
-| `discovery.py` | Workspace and `.agentman` directory resolution |
-| `structured_agents/spec.py` | Provider-neutral spec discovery plus `output:` and `tools:` parsing |
-| `schema.py`, `_schema_runner.py` | Repository-interpreter schema generation and validation |
-| `model.py` | Model and router capability resolution |
-| `agent.py` | pydantic-ai agent and capability construction |
-| `runtime.py` | DBOS workflow, history loading, run lifecycle, and cache |
-| `daemon.py` | ASGI transport, lifecycle, SSE registry, Postgres wiring and routes |
-| `processes.py` | Map of the shell commands of each run, and the SIGTERM and SIGKILL stop of their process groups |
-| `client.py` | Unix-socket HTTP client, SSE parsing, fan-out collection and deduplication |
-| `render.py` | On-demand Markdown from stored `ModelMessage` JSON |
-| `status.py` | Product status composed with journal facts |
-| `recovery.py` | Resume authorization; never a replay engine |
-| `persistence/store.py` | Product-facing thread/run CRUD |
-| `persistence/step_store.py` | Harness `StepStore` contract over Postgres |
-| `persistence/inspect.py` | Product-facing queries over the journal |
+The "Distribution" column names the wheel that ships each module.
+
+| Module | Distribution | Responsibility |
+| --- | --- | --- |
+| `__init__.py`, `protocol.py` | `agentman-client` | Package version and path extension; versioned socket request and response models |
+| `cli.py` | `agentman` | Typer commands, config/spec resolution, output validation, rendering and exit codes |
+| `config.py` | `agentman-client` | Flat global/repository config merge and provenance |
+| `discovery.py` | `agentman-client` | Workspace and `.agentman` directory resolution |
+| `structured_agents/spec.py` | `agentman-client` | Provider-neutral spec discovery plus `output:` and `tools:` parsing |
+| `schema.py`, `_schema_runner.py` | `agentman` | Repository-interpreter schema generation and validation |
+| `model.py` | `agentman` | Model and router capability resolution |
+| `agent.py` | `agentman` | pydantic-ai agent and capability construction |
+| `runtime.py` | `agentman` | DBOS workflow, history loading, run lifecycle, and cache |
+| `daemon.py` | `agentman` | ASGI transport, lifecycle, SSE registry, Postgres wiring and routes |
+| `processes.py` | `agentman` | Map of the shell commands of each run, and the SIGTERM and SIGKILL stop of their process groups |
+| `client.py` | `agentman-client` | Unix-socket HTTP client, SSE parsing, fan-out collection and deduplication |
+| `render.py` | `agentman` | On-demand Markdown from stored `ModelMessage` JSON |
+| `status.py` | `agentman` | Product status composed with journal facts |
+| `recovery.py` | `agentman` | Resume authorization; never a replay engine |
+| `persistence/store.py` | `agentman` | Product-facing thread/run CRUD |
+| `persistence/step_store.py` | `agentman` | Harness `StepStore` contract over Postgres |
+| `persistence/inspect.py` | `agentman` | Product-facing queries over the journal |
 
 `structured_agents` must not import `agentman`, DBOS, SQLAlchemy, or HTTP
-transport code. Import-linter contracts enforce that direction.
+transport code. The client modules must not import a server module or a server
+package. Import-linter contracts enforce both directions.

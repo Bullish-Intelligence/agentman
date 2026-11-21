@@ -150,8 +150,9 @@ The release note should state which gates ran, not just say “tests pass.”
 
 ### 4. Decide whether a second consumer warrants extracting `structured_agents`
 
-`structured_agents` is currently an internal provider-neutral boundary. Keep it
-small while agentman is its only consumer. A second real consumer is the
+`structured_agents` ships in the `agentman-client` distribution. It is an
+internal provider-neutral boundary. Keep it small while agentman and its
+clients are the only consumers. A second real consumer is the
 trigger to define a public API, release it separately, and document
 compatibility; do not widen it speculatively.
 

@@ -78,9 +78,10 @@ request for review.
 ## Layout
 
 ```text
-src/agentman/             # package source
-src/structured_agents/    # provider-neutral agent specification
-tests/                    # pytest tests
+src/agentman/             # agentman distribution: daemon, runtime, CLI (no __init__.py)
+packages/agentman-client/ # agentman-client distribution: client, protocol, config,
+                          #   discovery, and structured_agents (provider-neutral spec)
+tests/                    # pytest tests (client-only tests live in the client package)
 docs/                     # product, architecture, and operations documentation
 devenv.nix                # shell, services, and check tasks
 devenv.yaml               # inputs

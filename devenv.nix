@@ -51,7 +51,13 @@
       "setup:sync" = {
         exec = "uv sync --locked";
         # hatchling reads the readme when uv builds the editable install.
-        input.testee.reads = [ "uv.lock" "pyproject.toml" "README.md" ];
+        input.testee.reads = [
+          "uv.lock"
+          "pyproject.toml"
+          "README.md"
+          "packages/agentman-client/pyproject.toml"
+          "packages/agentman-client/README.md"
+        ];
       };
 
       "check:lint" = {
@@ -59,18 +65,18 @@
           out="''${TESTEE_RUN_DIR:-.devenv/state}"
           mkdir -p "$out"
           set -o pipefail
-          uv run --no-sync ruff check src tests --output-format json | tee "$out/check:lint.ruff.json"
+          uv run --no-sync ruff check src tests packages --output-format json | tee "$out/check:lint.ruff.json"
         '';
         input.testee.ignores = unread;
       };
 
       "check:format" = {
-        exec = "uv run --no-sync ruff format --check src tests";
+        exec = "uv run --no-sync ruff format --check src tests packages";
         input.testee.ignores = unread;
       };
 
       "check:types" = {
-        exec = "uv run --no-sync ty check src";
+        exec = "uv run --no-sync ty check src packages/agentman-client/src";
         input.testee.ignores = unread;
       };
 

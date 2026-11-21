@@ -10,6 +10,9 @@ authors = [
 ]
 
 dependencies = [
+  # The client, protocol, config, discovery, and spec loader live in the
+  # `agentman-client` workspace member. Keep its version equal to this one.
+  "agentman-client==0.0.4",
   "pydantic>=2",
   "pydantic-ai-slim[openai]>=2.41,<3",
   # Capped on purpose. `WorkflowRunIdStepPersistence` overrides `for_run` and
@@ -39,7 +42,11 @@ dependencies = [
 [dependency-groups]
 dev = ["import-linter", "pytest", "pytest-asyncio", "ruff", "ty"]
 
+[tool.uv.workspace]
+members = ["packages/agentman-client"]
+
 [tool.uv.sources]
+agentman-client = { workspace = true }
 # The agentman contract: ``resolve_router_url``, ``config_dir``, per-model
 # ``n_parallel``/``n_ctx``, and ``loaded``. agentman never parses the router's
 # argv; that reads inside inferference.
@@ -60,27 +67,30 @@ requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentman", "src/structured_agents", "migrations"]
+# This wheel ships no `agentman/__init__.py`. The `agentman-client` wheel ships
+# it and extends the package path, so both wheels share one `agentman/` folder.
+packages = ["src/agentman", "migrations"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py313"
-src = ["src"]
+src = ["src", "packages/agentman-client/src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
-testpaths = ["tests"]
-pythonpath = ["src"]
+testpaths = ["tests", "packages/agentman-client/tests"]
+pythonpath = ["src", "packages/agentman-client/src"]
 asyncio_mode = "auto"
 markers = [
   "integration: needs Postgres or the live model rig; set AGENTMAN_RUN_INTEGRATION=1",
 ]
 
 [tool.importlinter]
-root_package = "agentman"
+# Both packages are roots. `structured_agents` ships in the client distribution.
+root_packages = ["agentman", "structured_agents"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -106,3 +116,40 @@ name = "structured_agents stays provider-neutral"
 type = "forbidden"
 source_modules = ["structured_agents"]
 forbidden_modules = ["dbos", "sqlalchemy", "httpx"]
+
+[[tool.importlinter.contracts]]
+# The client distribution installs no server packages. These modules ship in
+# `agentman-client`, so they must not import a server module of `agentman` or a
+# server dependency. See docs/development.md.
+name = "the client distribution has no server imports"
+type = "forbidden"
+source_modules = [
+  "agentman.client",
+  "agentman.protocol",
+  "agentman.config",
+  "agentman.discovery",
+  "structured_agents",
+]
+forbidden_modules = [
+  "agentman._schema_runner",
+  "agentman.agent",
+  "agentman.cli",
+  "agentman.daemon",
+  "agentman.effects",
+  "agentman.model",
+  "agentman.persistence",
+  "agentman.processes",
+  "agentman.recovery",
+  "agentman.render",
+  "agentman.runtime",
+  "agentman.schema",
+  "agentman.status",
+  "dbos",
+  "sqlalchemy",
+  "asyncpg",
+  "psycopg",
+  "alembic",
+  "uvicorn",
+  "inferference",
+  "pydantic_ai_harness",
+]

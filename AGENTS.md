@@ -17,10 +17,11 @@ provides `uv`, the local Postgres service, and the check tools.
 ```bash
 devenv shell
 uv sync --all-extras
-uv run ruff check src tests
-uv run ruff format --check src tests
-uv run ty check src
+uv run ruff check src tests packages
+uv run ruff format --check src tests packages
+uv run ty check src packages/agentman-client/src
 uv run pytest
+uv run python tests/support/lint_imports.py
 ```
 
 Start the project Postgres service with `devenv up -d`. The default pytest run
@@ -33,10 +34,14 @@ files, credentials, keys, or database dumps.
 
 ## Layout
 
-- `src/agentman/` — the package: CLI, client, daemon, model resolution, runtime,
-  recovery, persistence, and status.
-- `src/structured_agents/` — the provider-neutral spec loader and extensions.
+- `src/agentman/` — the `agentman` distribution: CLI, daemon, model resolution,
+  runtime, recovery, persistence, and status. It has no `__init__.py`.
+- `packages/agentman-client/` — the `agentman-client` distribution, a uv
+  workspace member with no server dependencies: `agentman/__init__.py`, client,
+  protocol, config, discovery, and the provider-neutral spec loader
+  (`structured_agents`). Its tests are in `packages/agentman-client/tests/`.
 - `migrations/` — the frozen Alembic schema history.
+- `CHANGELOG.md` — release notes for both distributions.
 - `tests/` — unit, integration, crash-window, live-rig, and CLI tests.
 - `docs/` — the user-facing product, architecture, operations, and reference
   documents.
@@ -62,6 +67,11 @@ files, credentials, keys, or database dumps.
   receives JSON Schema, not repository Python objects.
 - Do not serialize turns behind a daemon-wide lock, queue, or exclusive
   connection. The `pipe --each` bound is local to one client invocation.
+
+- Keep one version for both distributions. Change both `pyproject.toml` files
+  and `__version__` together. `docs/development.md` lists the steps.
+- The client modules and `structured_agents` must not import a server module or
+  a server package. An import-linter contract and a test enforce this.
 
 ## Documentation
 
