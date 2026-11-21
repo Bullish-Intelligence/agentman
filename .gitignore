@@ -38,3 +38,4 @@ devenv.local.yaml
 .jj/
 
 # Keep devenv.lock and uv.lock tracked.
+/.workspaces/
