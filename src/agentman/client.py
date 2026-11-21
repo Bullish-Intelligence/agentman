@@ -249,15 +249,17 @@ def _parse_frame(frame: str) -> StreamEnvelope | None:
 async def _deduplicate(
     source: AsyncIterator[StreamEnvelope],
 ) -> AsyncGenerator[StreamEnvelope]:
-    """Drop repeated frames on ``(run_id, request ordinal, event ordinal)``.
+    """Drop repeated frames on ``(run_id, event ordinal)``.
 
-    DBOS may re-execute a step after a crash, so events can repeat. The
-    subscriber deduplicates; the record is authoritative and complete either
-    way.
+    The event ordinal is one sequence for the whole run, so it alone names an
+    event. DBOS may re-execute a step after a crash, so events can repeat. A
+    replayed step yields the same ordinals, and this function drops the copies.
+    The final frame has ordinal ``-1``. Only one final frame exists per turn.
+    The record is authoritative and complete either way.
     """
-    seen: set[tuple[str, int, int]] = set()
+    seen: set[tuple[str, int]] = set()
     async for envelope in source:
-        key = (envelope.run_id, envelope.request_ordinal, envelope.event_ordinal)
+        key = (envelope.run_id, envelope.event_ordinal)
         if key in seen:
             continue
         seen.add(key)

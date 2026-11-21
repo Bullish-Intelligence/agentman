@@ -62,10 +62,11 @@ async def test_event_handler_stamps_both_ordinals() -> None:
     assert isinstance(first, StreamEnvelope) and isinstance(second, StreamEnvelope)
     assert first.run_id == "run-1"
     assert first.request_ordinal == 5
-    assert (first.event_ordinal, second.event_ordinal) == (0, 1)
+    # Outside a DBOS step the registry counts from 1. Ordinal 0 stays free.
+    assert (first.event_ordinal, second.event_ordinal) == (1, 2)
 
 
-async def test_event_ordinal_resets_for_each_request() -> None:
+async def test_event_ordinal_continues_across_requests() -> None:
     registry = SubscriberRegistry()
     queue = registry.subscribe("run-1")
     handler = make_event_handler(registry)
@@ -74,11 +75,11 @@ async def test_event_ordinal_resets_for_each_request() -> None:
     first = queue.get_nowait()
     second = queue.get_nowait()
     assert isinstance(first, StreamEnvelope) and isinstance(second, StreamEnvelope)
-    assert (first.request_ordinal, first.event_ordinal) == (1, 0)
-    assert (second.request_ordinal, second.event_ordinal) == (2, 0)
+    assert (first.request_ordinal, first.event_ordinal) == (1, 1)
+    assert (second.request_ordinal, second.event_ordinal) == (2, 2)
 
 
-async def test_subscriber_deduplicates_on_the_triple() -> None:
+async def test_subscriber_deduplicates_on_the_run_ordinal() -> None:
     repeated = StreamEnvelope(run_id="r", request_ordinal=1, event_ordinal=2, kind="part_delta")
     distinct = StreamEnvelope(run_id="r", request_ordinal=1, event_ordinal=3, kind="part_delta")
 

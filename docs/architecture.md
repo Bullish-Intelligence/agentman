@@ -176,7 +176,20 @@ connections. Events are dropped when nobody is listening; the durable journal
 is authoritative.
 
 DBOS may replay a durable step, so the daemon stamps request and event ordinals.
-The client deduplicates on `(run_id, request_ordinal, event_ordinal)`.
+The request ordinal is `ctx.run_step`. The event ordinal is one sequence for the
+whole run, so the client deduplicates on `(run_id, event_ordinal)`.
+
+Inside a DBOS step, the event ordinal is `(step_id << 20) | index`. `step_id` is
+`DBOS.step_id`. It counts up in call order and stays the same when DBOS recovers
+the run. `index` is the position of the event in that handler call. DBOS gives
+each tool event its own step, and one step for each model request stream. A
+replayed step therefore yields the same ordinals, and the client drops the
+copies. DBOS step ids start at 1, so these ordinals are 1 or more. A handler call
+that emits 2**20 events or more raises an error. Outside a DBOS step, as in
+`run_turn` in tests, the subscriber registry counts events for the run, from 1,
+and forgets the counter when the last subscriber leaves. Ordinal 0 stays free
+for a daemon-stamped frame. The final frame keeps request and event ordinal `-1`.
+
 Streaming is therefore a presentation path with replay tolerance, not the
 source of truth for history. The current request path starts the workflow before
 registering the subscriber, so an initial event can be missed. On success the

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from typing import Any
 
 from dbos import DBOS, DBOSConfig
@@ -59,16 +60,26 @@ _STREAM_ADAPTER = TypeAdapter(AgentStreamEvent)
 logger = logging.getLogger(__name__)
 
 
+# One handler call numbers its events in the low bits. The DBOS step id sits above them.
+_STEP_INDEX_BITS = 20
+_MAX_EVENTS_PER_STEP = 1 << _STEP_INDEX_BITS
+
+
 class SubscriberRegistry:
     """``run_id -> subscriber`` queues. Nothing is buffered.
 
     The workflow can run on a worker thread while the HTTP connection drains on
     the event loop, so publishing is scheduled with ``call_soon_threadsafe``.
     A plain ``put_nowait`` from another thread would not wake the draining task.
+
+    It also holds the fallback event counter of each run, for events that
+    arrive outside a DBOS step. A lock guards the counters for the same reason.
     """
 
     def __init__(self) -> None:
         self._queues: dict[str, list[tuple[asyncio.Queue[StreamEnvelope | None], asyncio.AbstractEventLoop]]] = {}
+        self._counters: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     def subscribe(self, run_id: str) -> asyncio.Queue[StreamEnvelope | None]:
         queue: asyncio.Queue[StreamEnvelope | None] = asyncio.Queue()
@@ -85,6 +96,22 @@ class SubscriberRegistry:
             self._queues[run_id] = remaining
         else:
             self._queues.pop(run_id, None)
+            with self._lock:
+                self._counters.pop(run_id, None)
+
+    def next_ordinal(self, run_id: str) -> int | None:
+        """Return the next fallback event ordinal of a run, or ``None`` when nobody listens.
+
+        The counter starts at 1. Ordinal 0 is free for a daemon-stamped frame.
+        The registry forgets the counter when the last subscriber leaves. A late
+        event then gets ``None`` and does not make a new counter.
+        """
+        with self._lock:
+            if run_id not in self._queues:
+                return None
+            ordinal = self._counters.get(run_id, 0) + 1
+            self._counters[run_id] = ordinal
+            return ordinal
 
     def publish(self, run_id: str, envelope: StreamEnvelope | None) -> None:
         for queue, loop in self._queues.get(run_id, []):
@@ -101,24 +128,44 @@ class SubscriberRegistry:
 def make_event_handler(registry: SubscriberRegistry):
     """Return the ``event_stream_handler`` that stamps and publishes events.
 
-    The request ordinal is ``ctx.run_step``. The event ordinal is this
-    handler's own counter, reset per request. Neither ordinal exists on
-    ``AgentStreamEvent``; the daemon stamps both.
+    The request ordinal is ``ctx.run_step``. The event ordinal is one sequence
+    for the whole run. Neither ordinal exists on ``AgentStreamEvent``; the
+    daemon stamps both.
+
+    Inside a DBOS step, the event ordinal is ``(step_id << 20) | index``. The
+    step id counts up in call order and stays the same when DBOS recovers the
+    run. The index counts the events of this handler call. A step that DBOS runs
+    again therefore gives the same ordinals, and the client drops the copies.
+    Step ids start at 1, so these ordinals are 1 or more.
+
+    Outside a DBOS step, the registry counts events for the run, from 1.
     """
 
     async def handler(ctx: Any, events: Any) -> None:
         request_ordinal = ctx.run_step
-        event_ordinal = 0
+        step_id = DBOS.step_id
+        index = 0
         async for event in events:
+            if step_id is None:
+                ordinal = registry.next_ordinal(ctx.run_id)
+                if ordinal is None:
+                    continue
+            else:
+                if index >= _MAX_EVENTS_PER_STEP:
+                    raise RuntimeError(
+                        f"one handler call emitted {_MAX_EVENTS_PER_STEP} or more events; "
+                        "the event ordinal cannot number them"
+                    )
+                ordinal = (step_id << _STEP_INDEX_BITS) | index
+                index += 1
             envelope = StreamEnvelope(
                 run_id=ctx.run_id,
                 request_ordinal=request_ordinal,
-                event_ordinal=event_ordinal,
+                event_ordinal=ordinal,
                 kind=getattr(event, "event_kind", type(event).__name__),
                 event=_STREAM_ADAPTER.dump_python(event, mode="json"),
             )
             registry.publish(ctx.run_id, envelope)
-            event_ordinal += 1
 
     return handler
 

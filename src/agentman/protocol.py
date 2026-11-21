@@ -102,9 +102,16 @@ class StreamEnvelope(ResponseModel):
     """One SSE frame.
 
     DBOS may re-execute a step after a crash, so events can repeat. Subscribers
-    deduplicate on ``(run_id, request_ordinal, event_ordinal)``. The daemon
-    stamps both ordinals: the request ordinal from ``ctx.run_step``, the event
-    ordinal from its own counter, reset per request.
+    deduplicate on ``(run_id, event_ordinal)``. The daemon stamps both ordinals.
+    The request ordinal is ``ctx.run_step``.
+
+    The event ordinal is one sequence for the whole run. It increases in
+    publish order and never repeats for a different event. Inside a DBOS step it
+    is ``(step_id << 20) | index``: the DBOS step id plus the index of the event
+    in that step. A step that DBOS runs again after a crash yields the same
+    ordinals, so the subscriber drops the copies. Outside a DBOS step, the
+    daemon counts events for the run, from 1. Ordinal 0 is free for a
+    daemon-stamped frame. The final frame has request and event ordinal ``-1``.
     """
 
     protocol: int = PROTOCOL_VERSION

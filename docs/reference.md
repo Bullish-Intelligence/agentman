@@ -266,8 +266,9 @@ exception `type` and `message` when one exists.
 Turn history is not sent as a `messages` field. The daemon loads it by thread
 id from the journal. `TurnRequest.max_transport_retries` is optional and must
 be non-negative when present. SSE frames carry the protocol version, run id,
-request and event ordinals, event kind, event payload, and a final-result flag. Clients must
-deduplicate replayed frames by the stamped ordinal tuple.
+request and event ordinals, event kind, event payload, and a final-result flag. The event
+ordinal is one sequence for the whole run. Clients must deduplicate replayed frames by
+`(run_id, event_ordinal)`. The final frame has ordinal `-1`.
 
 ### SSE delivery and failure semantics
 
@@ -286,7 +287,10 @@ replay missed events from Postgres into a later subscriber. The journal and
 stored snapshots are authoritative.
 
 DBOS replay can cause an event to be observed more than once. The request and
-event ordinal tuple makes those duplicates removable by the client. This is
+event ordinal makes those duplicates removable by the client. Inside a DBOS step the ordinal
+is the DBOS step id shifted left by 20 bits, plus the index of the event in the step, so a
+replayed step yields the same ordinals. Outside a DBOS step, the daemon counts events for
+the run, from 1. This is
 different from dropped events: deduplication removes repeated delivery, but it
 cannot reconstruct a frame that was emitted before subscription or after the
 subscriber disappeared.
