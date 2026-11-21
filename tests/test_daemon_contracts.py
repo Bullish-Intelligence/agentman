@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from dbos._context import get_local_dbos_context
 from dbos._error import DBOSAwaitedWorkflowCancelledError
 from inferference import ConstraintKind, ModelInfo
 from pydantic import ValidationError
@@ -22,7 +24,7 @@ import agentman.daemon as daemon
 from agentman.config import Config, Value
 from agentman.daemon import AgentmanApp, _HttpError
 from agentman.persistence.store import RUN_TERMINAL, Run
-from agentman.protocol import CAPABILITIES, PROTOCOL_VERSION, ErrorResponse, TurnRequest
+from agentman.protocol import CAPABILITIES, PROTOCOL_VERSION, ErrorResponse, StreamEnvelope, TurnRequest
 
 
 def _app() -> AgentmanApp:
@@ -78,11 +80,23 @@ class _Store:
 
 
 class _CancelStore(_Store):
-    def __init__(self, run: Run) -> None:
+    """A store with a run row. ``hidden`` hides the row until the workflow starts.
+
+    The real workflow writes the row in its first step, so a new run has none
+    when the daemon checks for a duplicate id.
+    """
+
+    def __init__(self, run: Run, *, hidden: bool = False) -> None:
         super().__init__(run)
         self.updates: list[dict[str, Any]] = []
+        self.hidden = hidden
+
+    def reveal(self) -> None:
+        self.hidden = False
 
     async def get_run(self, run_id: str) -> Run | None:
+        if self.hidden:
+            return None
         return self.run if self.run is not None and self.run.id == run_id else None
 
     async def update_run(self, run_id: str, **fields: Any) -> None:
@@ -274,6 +288,7 @@ def _turn_request(
     model: str = "inferference:alias",
     schema: dict[str, Any] | None = None,
     max_transport_retries: int | None = None,
+    run_id: str | None = "run-1",
 ) -> TurnRequest:
     return TurnRequest(
         workspace="/repo",
@@ -282,7 +297,23 @@ def _turn_request(
         prompt="hello",
         output_schema=schema,
         max_transport_retries=max_transport_retries,
+        run_id=run_id,
     )
+
+
+def _frames_after_run_started(sent: list[dict[str, Any]]) -> list[str]:
+    """Return the SSE frames after the first one, which must be ``run_started``."""
+    frames = [message["body"].decode() for message in sent if message.get("more_body")]
+    assert frames[0].startswith("event: run_started\n")
+    return frames[1:]
+
+
+def _types_without_run_started(sent: list[dict[str, Any]]) -> list[str]:
+    """Return the ASGI message types, without the ``run_started`` frame.
+
+    A disconnect can come before or after the daemon sends that frame.
+    """
+    return [message["type"] for message in sent if not message.get("body", b"").startswith(b"event: run_started\n")]
 
 
 def test_turn_request_rejects_negative_transport_retries() -> None:
@@ -472,6 +503,10 @@ def test_failed_workflow_emits_terminal_error_without_exception_details(monkeypa
 
     class _DBOS:
         @staticmethod
+        async def get_workflow_status_async(run_id: str) -> None:
+            return None
+
+        @staticmethod
         async def start_workflow_async(*_: object) -> _Handle:
             return _Handle()
 
@@ -487,7 +522,7 @@ def test_failed_workflow_emits_terminal_error_without_exception_details(monkeypa
         )
 
     asyncio.run(exercise())
-    frames = [message["body"].decode() for message in sent if message.get("more_body")]
+    frames = _frames_after_run_started(sent)
     assert len(frames) == 1
     assert "event: turn_error" in frames[0]
     assert '"final":true' in frames[0]
@@ -497,11 +532,12 @@ def test_failed_workflow_emits_terminal_error_without_exception_details(monkeypa
 
 def test_turn_handler_cancels_the_run_on_disconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     app = _app()
-    store = _CancelStore(_run("/repo"))
+    store = _CancelStore(_run("/repo"), hidden=True)
     app.store = cast(Any, store)
     app.step_store = cast(Any, _EmptyStepStore())
     cancelled: list[str] = []
     cancellation_requested = asyncio.Event()
+    started = False
 
     class _Handle:
         def get_workflow_id(self) -> str:
@@ -514,6 +550,9 @@ def test_turn_handler_cancels_the_run_on_disconnect(monkeypatch: pytest.MonkeyPa
     class _DBOS:
         @staticmethod
         async def start_workflow_async(*_: object) -> _Handle:
+            nonlocal started
+            started = True
+            store.reveal()
             return _Handle()
 
         @staticmethod
@@ -522,8 +561,8 @@ def test_turn_handler_cancels_the_run_on_disconnect(monkeypatch: pytest.MonkeyPa
             cancellation_requested.set()
 
         @staticmethod
-        async def get_workflow_status_async(run_id: str) -> SimpleNamespace:
-            return SimpleNamespace(status="CANCELLED")
+        async def get_workflow_status_async(run_id: str) -> SimpleNamespace | None:
+            return SimpleNamespace(status="CANCELLED") if started else None
 
     monkeypatch.setattr(daemon, "DBOS", _DBOS)
     sent: list[dict[str, Any]] = []
@@ -557,22 +596,21 @@ def test_turn_handler_cancels_the_run_on_disconnect(monkeypatch: pytest.MonkeyPa
     assert store.run.status == "cancelled"
     assert store.run.error == {"reason": "client_disconnected", "type": None, "message": None}
     assert store.updates[0]["usage"]["requests"] == 0
-    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert _types_without_run_started(sent) == ["http.response.start"]
     assert app.registry._queues == {}
 
 
 def test_turn_handler_sends_turn_error_with_the_cancel_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     app = _app()
-    app.store = cast(
-        Any,
-        _CancelStore(
-            _run(
-                workspace="/repo",
-                status="cancelled",
-                error={"reason": "cancel_requested", "type": None, "message": None},
-            )
+    store = _CancelStore(
+        _run(
+            workspace="/repo",
+            status="cancelled",
+            error={"reason": "cancel_requested", "type": None, "message": None},
         ),
+        hidden=True,
     )
+    app.store = cast(Any, store)
 
     class _Handle:
         def get_workflow_id(self) -> str:
@@ -583,7 +621,12 @@ def test_turn_handler_sends_turn_error_with_the_cancel_reason(monkeypatch: pytes
 
     class _DBOS:
         @staticmethod
+        async def get_workflow_status_async(run_id: str) -> None:
+            return None
+
+        @staticmethod
         async def start_workflow_async(*_: object) -> _Handle:
+            store.reveal()
             return _Handle()
 
     monkeypatch.setattr(daemon, "DBOS", _DBOS)
@@ -598,7 +641,7 @@ def test_turn_handler_sends_turn_error_with_the_cancel_reason(monkeypatch: pytes
         )
 
     asyncio.run(exercise())
-    frames = [message["body"].decode() for message in sent if message.get("more_body")]
+    frames = _frames_after_run_started(sent)
     assert len(frames) == 1
     assert "event: turn_error" in frames[0]
     assert '"error":"turn cancelled"' in frames[0]
@@ -798,9 +841,20 @@ def _disconnect_turn(
     cancelled: list[str] = []
     base = _dbos(cancelled=cancelled, cancel_error=cancel_error)
 
+    started = False
+
     class _DBOS(base):  # type: ignore[valid-type, misc]
         @staticmethod
+        async def get_workflow_status_async(run_id: str) -> SimpleNamespace | None:
+            return await base.get_workflow_status_async(run_id) if started else None
+
+        @staticmethod
         async def start_workflow_async(*_: object) -> _PendingHandle:
+            nonlocal started
+            started = True
+            reveal = getattr(app.store, "reveal", None)
+            if reveal is not None:
+                reveal()
             return handle
 
         @staticmethod
@@ -830,7 +884,7 @@ def test_disconnect_before_the_run_row_exists_still_cancels_the_workflow(monkeyp
     app.store = cast(Any, _Store())
     cancelled, sent = _disconnect_turn(monkeypatch, app, handle=_PendingHandle())
     assert cancelled == ["run-1"]
-    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert _types_without_run_started(sent) == ["http.response.start"]
     assert app.registry._queues == {}
 
 
@@ -838,14 +892,23 @@ def test_disconnect_survives_a_store_error_and_still_cancels_the_workflow(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     class _BrokenStore(_Store):
+        """The database fails after the workflow starts."""
+
+        broken = False
+
+        def reveal(self) -> None:
+            self.broken = True
+
         async def get_run(self, run_id: str) -> Run | None:
-            raise RuntimeError("the database is down")
+            if self.broken:
+                raise RuntimeError("the database is down")
+            return None
 
     app = _app()
     app.store = cast(Any, _BrokenStore())
     cancelled, sent = _disconnect_turn(monkeypatch, app, handle=_PendingHandle())
     assert cancelled == ["run-1"]
-    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert _types_without_run_started(sent) == ["http.response.start"]
     assert "the database is down" in caplog.text
 
 
@@ -853,12 +916,12 @@ def test_disconnect_survives_a_dbos_cancel_error(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     app = _app()
-    app.store = cast(Any, _CancelStore(_run("/repo")))
+    app.store = cast(Any, _CancelStore(_run("/repo"), hidden=True))
     cancelled, sent = _disconnect_turn(
         monkeypatch, app, handle=_PendingHandle(), cancel_error=RuntimeError("DBOS is down")
     )
     assert cancelled == ["run-1"]
-    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert _types_without_run_started(sent) == ["http.response.start"]
     assert "DBOS is down" in caplog.text
 
 
@@ -868,7 +931,7 @@ def test_disconnect_logs_an_unexpected_workflow_error_and_does_not_raise(
     app = _app()
     app.store = cast(Any, _Store())
     _, sent = _disconnect_turn(monkeypatch, app, handle=_PendingHandle(RuntimeError("workflow exploded")))
-    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert _types_without_run_started(sent) == ["http.response.start"]
     assert "workflow exploded" in caplog.text
 
 
@@ -962,7 +1025,8 @@ def test_stream_sends_turn_result_when_a_cancel_met_a_completed_run(monkeypatch:
         usage={"requests": 1},
         run_metadata={"logical_turn_count": 1},
     )
-    app.store = cast(Any, _CancelStore(completed))
+    store = _CancelStore(completed, hidden=True)
+    app.store = cast(Any, store)
 
     class _Handle:
         def get_workflow_id(self) -> str:
@@ -973,7 +1037,12 @@ def test_stream_sends_turn_result_when_a_cancel_met_a_completed_run(monkeypatch:
 
     class _DBOS:
         @staticmethod
+        async def get_workflow_status_async(run_id: str) -> None:
+            return None
+
+        @staticmethod
         async def start_workflow_async(*_: object) -> _Handle:
+            store.reveal()
             return _Handle()
 
     monkeypatch.setattr(daemon, "DBOS", _DBOS)
@@ -988,7 +1057,7 @@ def test_stream_sends_turn_result_when_a_cancel_met_a_completed_run(monkeypatch:
         )
 
     asyncio.run(exercise())
-    frames = [message["body"].decode() for message in sent if message.get("more_body")]
+    frames = _frames_after_run_started(sent)
     assert len(frames) == 1
     assert "event: turn_result" in frames[0]
     assert "turn_error" not in frames[0]
@@ -1049,3 +1118,337 @@ def test_resume_refuses_a_run_that_dbos_cancelled_and_repairs_the_row(
     assert resumed == []
     assert store.run is not None and store.run.status == "cancelled"
     assert store.run.error is not None and store.run.error["reason"] == "workflow_cancelled"
+
+
+# -- run id, run_started, and early events ------------------------------------
+
+
+def _assigned_workflow_id() -> str:
+    """Return the id that ``SetWorkflowID`` assigned to the next workflow."""
+    context = get_local_dbos_context()
+    assert context is not None, "start_workflow_async ran outside SetWorkflowID"
+    return context.id_assigned_for_next_workflow
+
+
+def _early_event(run_id: str) -> StreamEnvelope:
+    return StreamEnvelope(run_id=run_id, request_ordinal=1, event_ordinal=1, kind="part_start", event={"early": True})
+
+
+class _ResultHandle:
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+
+    def get_workflow_id(self) -> str:
+        return self.run_id
+
+    async def get_result(self) -> object:
+        # Let the drain task send what the queue holds before the result ends the stream.
+        await asyncio.sleep(0.01)
+        return SimpleNamespace(
+            run_id=self.run_id,
+            thread_id="thread-1",
+            output="done",
+            output_type="str",
+            messages=[],
+            usage=None,
+            run_metadata={},
+        )
+
+
+def _stream_turn(
+    monkeypatch: pytest.MonkeyPatch, app: AgentmanApp, request: TurnRequest, *, publish_early: bool
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Stream one turn through a fake DBOS. Return the sent messages and the started ids.
+
+    With ``publish_early``, the fake workflow start publishes an event for the
+    run and yields. A subscriber that registers after the start misses it.
+    """
+    started: list[str] = []
+
+    class _DBOS:
+        @staticmethod
+        async def get_workflow_status_async(run_id: str) -> None:
+            return None
+
+        @staticmethod
+        async def start_workflow_async(*_: object) -> _ResultHandle:
+            run_id = _assigned_workflow_id()
+            started.append(run_id)
+            if publish_early:
+                app.registry.publish(run_id, _early_event(run_id))
+                await asyncio.sleep(0)
+            return _ResultHandle(run_id)
+
+    monkeypatch.setattr(daemon, "DBOS", _DBOS)
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._handle_turn(request.model_dump_json().encode(), _wait_forever_receive, send)
+
+    asyncio.run(exercise())
+    return sent, started
+
+
+def _sse_frames(sent: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [json.loads(message["body"].decode().split("data: ", 1)[1]) for message in sent if message.get("more_body")]
+
+
+def test_an_event_published_at_workflow_start_reaches_the_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    app.store = cast(Any, _Store())
+    sent, _ = _stream_turn(monkeypatch, app, _turn_request(model="mock:model"), publish_early=True)
+    frames = _sse_frames(sent)
+    assert [frame["kind"] for frame in frames] == ["run_started", "part_start", "turn_result"]
+    assert frames[1]["event"] == {"early": True}
+    assert app.registry._queues == {}
+
+
+def test_every_stream_starts_with_run_started_and_names_the_id_in_a_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    app.store = cast(Any, _Store())
+    sent, started = _stream_turn(monkeypatch, app, _turn_request(model="mock:model", run_id=None), publish_early=False)
+    first = _sse_frames(sent)[0]
+    run_id = started[0]
+    assert str(uuid.UUID(run_id)) == run_id, "the daemon makes a UUID when the client sends no id"
+    assert first["kind"] == "run_started"
+    assert first["run_id"] == run_id
+    assert first["event"] == {"run_id": run_id}
+    assert (first["request_ordinal"], first["event_ordinal"], first["final"]) == (0, 0, False)
+    assert (b"x-agentman-run-id", run_id.encode()) in sent[0]["headers"]
+    assert _sse_frames(sent)[-1]["run_id"] == run_id
+
+
+def test_a_client_run_id_becomes_the_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    app.store = cast(Any, _Store())
+    sent, started = _stream_turn(
+        monkeypatch, app, _turn_request(model="mock:model", run_id="folio.run-7_a"), publish_early=False
+    )
+    assert started == ["folio.run-7_a"]
+    assert [frame["run_id"] for frame in _sse_frames(sent)] == ["folio.run-7_a", "folio.run-7_a"]
+
+
+def _post_turn(app: AgentmanApp, body: bytes) -> list[dict[str, Any]]:
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> None:
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        await app._http({"method": "POST", "path": "/v1/turns", "query_string": b""}, receive, send)
+
+    asyncio.run(exercise())
+    return sent
+
+
+def _refusing_dbos(monkeypatch: pytest.MonkeyPatch, *, status: str | None = None) -> list[str]:
+    """Install a fake DBOS that records each workflow start. ``status`` is the existing workflow."""
+    started: list[str] = []
+
+    class _DBOS:
+        @staticmethod
+        async def get_workflow_status_async(run_id: str) -> SimpleNamespace | None:
+            return None if status is None else SimpleNamespace(status=status)
+
+        @staticmethod
+        async def start_workflow_async(*_: object) -> None:
+            started.append(_assigned_workflow_id())
+            raise AssertionError("a refused turn must not start a workflow")
+
+    monkeypatch.setattr(daemon, "DBOS", _DBOS)
+    return started
+
+
+def test_a_run_id_in_the_registry_returns_409_and_keeps_the_first_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    app.store = cast(Any, _Store())
+    started = _refusing_dbos(monkeypatch)
+
+    async def exercise() -> list[dict[str, Any]]:
+        first = app.registry.reserve("run-1")
+        assert first is not None
+        assert app.registry.reserve("run-1") is None
+        sent: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        body = _turn_request(model="mock:model").model_dump_json().encode()
+        with pytest.raises(_HttpError) as refused:
+            await app._handle_turn(body, _wait_forever_receive, send)
+        assert refused.value.status == 409
+        assert "run-1" in app.registry._queues, "the refused request keeps the first subscriber"
+        return sent
+
+    assert asyncio.run(exercise()) == []
+    assert started == []
+
+
+@pytest.mark.parametrize("existing", ["row", "workflow"])
+def test_a_run_id_of_an_existing_run_returns_409(monkeypatch: pytest.MonkeyPatch, existing: str) -> None:
+    app = _app()
+    app.store = cast(Any, _Store(_run("/repo", status="completed") if existing == "row" else None))
+    started = _refusing_dbos(monkeypatch, status="SUCCESS" if existing == "workflow" else None)
+
+    sent = _post_turn(app, _turn_request(model="mock:model").model_dump_json().encode())
+
+    assert sent[0]["status"] == 409
+    assert "already exists" in json.loads(sent[1]["body"])["error"]
+    assert started == []
+    assert app.registry._queues == {}
+    assert app._live == {}
+
+
+@pytest.mark.parametrize("bad", ["", " ", "has space", "../escape", "x" * 65, "a/b", "naïve"])
+def test_a_malformed_run_id_returns_422_and_starts_nothing(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    app = _app()
+    app.store = cast(Any, _Store())
+    started = _refusing_dbos(monkeypatch)
+    body = json.dumps(
+        {"workspace": "/repo", "thread_id": "thread-1", "model": "mock:model", "prompt": "hello", "run_id": bad}
+    ).encode()
+
+    sent = _post_turn(app, body)
+
+    assert sent[0]["status"] == 422
+    assert "run_id" in json.loads(sent[1]["body"])["detail"]
+    assert started == []
+    assert app.registry._queues == {}
+
+
+def test_health_lists_the_client_run_id_capability() -> None:
+    assert "client-run-id" in CAPABILITIES
+
+
+class _RowStore:
+    """A store that keeps rows in memory. The workflow create step never ran."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, Run] = {}
+
+    async def get_run(self, run_id: str) -> Run | None:
+        return self.rows.get(run_id)
+
+    async def get_thread(self, thread_id: str) -> object:
+        return SimpleNamespace(id=thread_id)
+
+    async def create_run(self, *, run_id: str, **fields: Any) -> Run:
+        now = datetime.now(UTC)
+        row = Run(
+            id=run_id,
+            output_json=None,
+            output_type=None,
+            messages_json=None,
+            usage=None,
+            created_at=now,
+            updated_at=now,
+            **fields,
+        )
+        self.rows[run_id] = row
+        return row
+
+    async def finish_run(self, run_id: str, **fields: Any) -> bool:
+        row = self.rows.get(run_id)
+        if row is None or row.status != "running":
+            return False
+        self.rows[run_id] = replace(row, **fields)
+        return True
+
+
+def test_cancel_by_id_right_after_run_started_ends_with_cancel_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app()
+    store = _RowStore()
+    app.store = cast(Any, store)
+    app.step_store = cast(Any, _EmptyStepStore())
+    cancelled: list[str] = []
+    release_start = asyncio.Event()
+    workflow_cancelled = asyncio.Event()
+    started = False
+
+    class _Handle:
+        def get_workflow_id(self) -> str:
+            return "run-1"
+
+        async def get_result(self) -> object:
+            await workflow_cancelled.wait()
+            raise DBOSAwaitedWorkflowCancelledError("run-1")
+
+    class _DBOS:
+        @staticmethod
+        async def get_workflow_status_async(run_id: str) -> SimpleNamespace | None:
+            return SimpleNamespace(status="CANCELLED") if workflow_cancelled.is_set() else None
+
+        @staticmethod
+        async def start_workflow_async(*_: object) -> _Handle:
+            nonlocal started
+            await release_start.wait()
+            started = True
+            return _Handle()
+
+        @staticmethod
+        async def cancel_workflow_async(run_id: str) -> None:
+            assert started, "DBOS cannot cancel a workflow that was not started"
+            cancelled.append(run_id)
+            workflow_cancelled.set()
+
+    monkeypatch.setattr(daemon, "DBOS", _DBOS)
+    sent: list[dict[str, Any]] = []
+
+    async def exercise() -> dict[str, Any]:
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+
+        turn = asyncio.create_task(
+            app._handle_turn(_turn_request(model="mock:model").model_dump_json().encode(), _wait_forever_receive, send)
+        )
+        # Wait for run_started. The workflow has not started, and its row does not exist.
+        while not any(message.get("more_body") for message in sent):
+            await asyncio.sleep(0)
+        assert store.rows == {}
+        cancel = asyncio.create_task(app.cancel_run("run-1", workspace="/repo", reason="cancel_requested"))
+        await asyncio.sleep(0.01)
+        assert cancelled == [], "the cancel waits for the workflow start"
+        release_start.set()
+        result = await cancel
+        await turn
+        return result
+
+    result = asyncio.run(exercise())
+
+    assert result == {"run_id": "run-1", "status": "cancelled", "cancelled": True}
+    assert cancelled == ["run-1"]
+    frames = _sse_frames(sent)
+    assert [frame["kind"] for frame in frames] == ["run_started", "turn_error"]
+    assert frames[1]["event"]["reason"] == "cancel_requested"
+    row = store.rows["run-1"]
+    assert row.status == "cancelled"
+    assert row.error == {"reason": "cancel_requested", "type": None, "message": None}
+    assert (row.thread_id, row.workspace, row.prompt) == ("thread-1", "/repo", "hello")
+    assert app._live == {}
+
+
+def test_cancel_of_an_unknown_live_run_still_returns_404_and_checks_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app()
+    app.store = cast(Any, _RowStore())
+    monkeypatch.setattr(daemon, "DBOS", _dbos(cancelled=[]))
+    with pytest.raises(_HttpError) as unknown:
+        asyncio.run(_cancel(app))
+    assert unknown.value.status == 404
+
+    async def other_workspace() -> None:
+        live = daemon._LiveRun(workspace="/other", thread_id="t", agent="", model="m", prompt="p")
+        live.started.set()
+        app._live["run-1"] = live
+        await app.cancel_run("run-1", workspace="/repo", reason="cancel_requested")
+
+    with pytest.raises(_HttpError) as refused:
+        asyncio.run(other_workspace())
+    assert refused.value.status == 409

@@ -373,6 +373,11 @@ def send(
         help="Set the local provider's transport retry limit for this run.",
     ),
     json_output: bool = typer.Option(False, "--json", help="print the validated output and suppress the stream"),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help="Use this run id. The daemon refuses an id that exists.",
+    ),
 ) -> None:
     """One turn."""
     _call(
@@ -382,6 +387,7 @@ def send(
             model=model,
             json_output=json_output,
             max_transport_retries=max_transport_retries,
+            run_id=run_id,
         )
     )
 
@@ -446,6 +452,7 @@ async def _one_turn(
     model: str | None,
     json_output: bool,
     max_transport_retries: int | None = None,
+    run_id: str | None = None,
 ) -> None:
     context = _context(agent=agent, model=model)
     setup = _prepare_turn(context)
@@ -457,6 +464,7 @@ async def _one_turn(
             thread_id=thread_id,
             prompt=message,
             max_transport_retries=max_transport_retries,
+            run_id=run_id,
         )
         final: TurnResponse | None = None
         stream_error: str | None = None
@@ -603,6 +611,7 @@ def _turn_request(
     thread_id: str,
     prompt: str,
     max_transport_retries: int | None = None,
+    run_id: str | None = None,
 ) -> TurnRequest:
     return TurnRequest(
         workspace=setup.context.workspace,
@@ -615,6 +624,7 @@ def _turn_request(
         output_schema=setup.output_schema,
         output_type=setup.output_type,
         max_transport_retries=max_transport_retries,
+        run_id=run_id,
     )
 
 

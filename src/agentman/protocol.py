@@ -30,7 +30,10 @@ PROTOCOL_VERSION = 4
 
 # The features the daemon lists in the health response. Append a name here
 # when a change adds an optional request feature without a version bump.
-CAPABILITIES: tuple[str, ...] = ("cancel",)
+CAPABILITIES: tuple[str, ...] = ("cancel", "client-run-id")
+
+# The pattern of a client run id. The run table column holds 64 characters.
+RUN_ID_PATTERN = r"^[A-Za-z0-9._-]{1,64}$"
 
 
 class RequestModel(BaseModel):
@@ -49,7 +52,12 @@ class ResponseModel(BaseModel):
 
 
 class TurnRequest(RequestModel):
-    """One turn. History is loaded by the daemon from ``thread_id``."""
+    """One turn. History is loaded by the daemon from ``thread_id``.
+
+    ``run_id`` is optional. The daemon uses it as the run id, which is the
+    DBOS workflow id. The daemon answers 409 when a run or a live stream
+    already uses the id. The daemon lists the ``client-run-id`` capability.
+    """
 
     workspace: str
     thread_id: str
@@ -61,6 +69,7 @@ class TurnRequest(RequestModel):
     output_schema: dict[str, Any] | None = None
     output_type: str | None = None
     max_transport_retries: int | None = Field(default=None, ge=0)
+    run_id: str | None = Field(default=None, pattern=RUN_ID_PATTERN)
 
 
 class RunMetadata(ResponseModel):
@@ -110,8 +119,14 @@ class StreamEnvelope(ResponseModel):
     is ``(step_id << 20) | index``: the DBOS step id plus the index of the event
     in that step. A step that DBOS runs again after a crash yields the same
     ordinals, so the subscriber drops the copies. Outside a DBOS step, the
-    daemon counts events for the run, from 1. Ordinal 0 is free for a
-    daemon-stamped frame. The final frame has request and event ordinal ``-1``.
+    daemon counts events for the run, from 1. The final frame has request and
+    event ordinal ``-1``.
+
+    The first frame of every stream has kind ``run_started``. It is a normal
+    non-final frame with request and event ordinal ``0``, and its event is
+    ``{"run_id": ...}``. The daemon sends it before the workflow starts, so the
+    client knows the run id before any model event. Ordinal 0 belongs to this
+    frame alone. The response header ``x-agentman-run-id`` carries the same id.
     """
 
     protocol: int = PROTOCOL_VERSION
@@ -222,6 +237,7 @@ class ErrorResponse(ResponseModel):
 __all__ = [
     "CAPABILITIES",
     "PROTOCOL_VERSION",
+    "RUN_ID_PATTERN",
     "ErrorResponse",
     "CancelRequest",
     "CancelResponse",

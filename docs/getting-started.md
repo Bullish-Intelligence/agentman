@@ -186,6 +186,15 @@ The setting applies to `inferference:` models. Zero permits one initial
 request and no transport retry. It does not disable Pydantic AI output or tool
 retries. Set `retries: 0` in the agent specification to control those retries.
 
+Choose the run id of a turn, so that another program can cancel it by id:
+
+```sh
+agentman send --run-id review-42 "Review the current working tree."
+```
+
+The id uses letters, digits, `.`, `_`, and `-`, and has at most 64 characters.
+The daemon refuses an id that a run already uses.
+
 Fan out one independent run per input line:
 
 ```sh

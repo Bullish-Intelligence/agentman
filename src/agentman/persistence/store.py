@@ -145,6 +145,7 @@ class Store:
         prompt: str,
         run_metadata: dict[str, Any] | None = None,
         status: str = RUN_RUNNING,
+        error: dict[str, Any] | None = None,
     ) -> Run:
         now = datetime.now(UTC)
         async with self._engine.begin() as connection:
@@ -158,6 +159,7 @@ class Store:
                     status=status,
                     prompt=prompt,
                     run_metadata=run_metadata or {},
+                    error=error,
                     created_at=now,
                     updated_at=now,
                 )
@@ -177,6 +179,7 @@ class Store:
             created_at=now,
             updated_at=now,
             run_metadata=run_metadata or {},
+            error=error,
         )
 
     async def update_run(self, run_id: str, **fields: Any) -> None:

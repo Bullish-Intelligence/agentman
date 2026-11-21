@@ -4,10 +4,15 @@ An ASGI app served over a Unix socket. The daemon is never a second
 implementation of the turn: it calls the same :func:`agentman.runtime.execute`
 that tests call directly.
 
-It holds one piece of mutable state: a ``run_id -> subscriber`` registry.
-``event_stream_handler`` fires inside the DBOS model step and publishes to it;
-the matching HTTP connection drains it. When nobody is listening, events are
-dropped, not buffered. The stream is presentation; the record is authoritative.
+It holds two pieces of mutable state. The first is a ``run_id -> subscriber``
+registry. ``event_stream_handler`` fires inside the DBOS model step and
+publishes to it; the matching HTTP connection drains it. When nobody is
+listening, events are dropped, not buffered. The stream is presentation; the
+record is authoritative.
+
+The second is a map of live runs. The turn handler subscribes and adds the run
+before it starts the workflow, so no event is lost. The map lets a cancel find a
+run whose row does not exist yet.
 """
 
 from __future__ import annotations
@@ -17,13 +22,16 @@ import json
 import logging
 import os
 import threading
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
-from dbos import DBOS, DBOSConfig
+from dbos import DBOS, DBOSConfig, SetWorkflowID
 from dbos._error import DBOSAwaitedWorkflowCancelledError
 from inferference import InferferenceClient
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.messages import AgentStreamEvent
+from sqlalchemy.exc import IntegrityError
 
 from agentman import __version__
 from agentman.config import Config
@@ -86,6 +94,16 @@ class SubscriberRegistry:
         loop = asyncio.get_running_loop()
         self._queues.setdefault(run_id, []).append((queue, loop))
         return queue
+
+    def reserve(self, run_id: str) -> asyncio.Queue[StreamEnvelope | None] | None:
+        """Subscribe to a run id that has no subscriber. Return ``None`` when one exists.
+
+        The check and the subscribe have no await between them, so two requests
+        cannot both reserve the same id.
+        """
+        if run_id in self._queues:
+            return None
+        return self.subscribe(run_id)
 
     def unsubscribe(self, run_id: str, queue: asyncio.Queue[StreamEnvelope | None]) -> None:
         subscribers = self._queues.get(run_id)
@@ -170,12 +188,32 @@ def make_event_handler(registry: SubscriberRegistry):
     return handler
 
 
+@dataclass
+class _LiveRun:
+    """A run between the reservation of its id and the end of its stream.
+
+    The workflow writes the run row in its first step, so the row can be absent
+    while the run is live. This record holds what a cancel needs in that window.
+    """
+
+    workspace: str
+    thread_id: str
+    agent: str
+    model: str
+    prompt: str
+    # Set when the workflow has started, or when the start failed.
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set by ``cancel_run`` before it asks DBOS to cancel.
+    cancel_reason: str | None = None
+
+
 class AgentmanApp:
     """The ASGI application."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
         self.registry = SubscriberRegistry()
+        self._live: dict[str, _LiveRun] = {}
         self.engine: Any = None
         self.store: Store | None = None
         self.step_store: PostgresStepStore | None = None
@@ -357,20 +395,72 @@ class AgentmanApp:
             n_ctx=n_ctx,
             max_transport_retries=request.max_transport_retries,
         )
-        handle = await DBOS.start_workflow_async(execute, turn)
-        run_id = handle.get_workflow_id()
-        queue = self.registry.subscribe(run_id)
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [(b"content-type", b"text/event-stream"), (b"cache-control", b"no-cache")],
-            }
+        run_id = request.run_id or str(uuid.uuid4())
+        # Subscribe before the workflow starts, so no event is lost. The check
+        # and the subscribe have no await between them.
+        queue = self.registry.reserve(run_id)
+        if queue is None:
+            raise _HttpError(409, f"run {run_id!r} is already in use")
+        live = _LiveRun(
+            workspace=request.workspace,
+            thread_id=request.thread_id,
+            agent=request.agent_name or "",
+            model=model,
+            prompt=request.prompt,
         )
-        result_task = asyncio.create_task(handle.get_result())
-        drain_task = asyncio.create_task(_drain(queue, send))
-        disconnect_task = asyncio.create_task(_wait_disconnect(receive))
+        self._live[run_id] = live
+        drain_task: asyncio.Task[None] | None = None
+        disconnect_task: asyncio.Task[None] | None = None
+        result_task: asyncio.Task[Any] | None = None
         try:
+            await self._refuse_existing_run(run_id)
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"text/event-stream"),
+                        (b"cache-control", b"no-cache"),
+                        (b"x-agentman-run-id", run_id.encode()),
+                    ],
+                }
+            )
+            self.registry.publish(
+                run_id,
+                StreamEnvelope(
+                    run_id=run_id,
+                    request_ordinal=0,
+                    event_ordinal=0,
+                    kind="run_started",
+                    event={"run_id": run_id},
+                ),
+            )
+            drain_task = asyncio.create_task(_drain(queue, send))
+            disconnect_task = asyncio.create_task(_wait_disconnect(receive))
+            try:
+                with SetWorkflowID(run_id):
+                    handle = await DBOS.start_workflow_async(execute, turn)
+            except Exception:
+                # The response already started. Nothing on this path may raise.
+                logger.exception("could not start the workflow of run %s", run_id)
+                live.started.set()
+                self.registry.publish(run_id, None)
+                await drain_task
+                await _send_sse(
+                    send,
+                    StreamEnvelope(
+                        run_id=run_id,
+                        request_ordinal=-1,
+                        event_ordinal=-1,
+                        kind="turn_error",
+                        event={"error": "turn failed before it started"},
+                        final=True,
+                    ),
+                )
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+                return
+            live.started.set()
+            result_task = asyncio.create_task(handle.get_result())
             done, _ = await asyncio.wait(
                 (result_task, disconnect_task),
                 return_when=asyncio.FIRST_COMPLETED,
@@ -401,9 +491,10 @@ class AgentmanApp:
                     # The turn finished before the cancel took effect. The row is the result.
                     await _send_sse(send, _result_frame(run))
                 else:
-                    reason = (
-                        run.error.get("reason") if run is not None and run.error is not None else "workflow_cancelled"
-                    )
+                    if run is not None and run.error is not None:
+                        reason = run.error.get("reason")
+                    else:
+                        reason = live.cancel_reason or "workflow_cancelled"
                     await _send_sse(
                         send,
                         StreamEnvelope(
@@ -451,11 +542,23 @@ class AgentmanApp:
                 await _send_sse(send, final)
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         finally:
-            for task in (result_task, drain_task, disconnect_task):
+            live.started.set()
+            self._live.pop(run_id, None)
+            tasks = [task for task in (result_task, drain_task, disconnect_task) if task is not None]
+            for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(result_task, drain_task, disconnect_task, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
             self.registry.unsubscribe(run_id, queue)
+
+    async def _refuse_existing_run(self, run_id: str) -> None:
+        """Raise 409 when a workflow or a run row already uses the id.
+
+        DBOS does not refuse a duplicate workflow id. It returns a handle to the
+        existing workflow, so the daemon checks for itself.
+        """
+        if await DBOS.get_workflow_status_async(run_id) is not None or await self._store().get_run(run_id) is not None:
+            raise _HttpError(409, f"run {run_id!r} already exists")
 
     async def cancel_run(self, run_id: str, *, workspace: str, reason: str) -> dict[str, Any]:
         """Cancel a workflow and record the run state after DBOS accepts it.
@@ -465,46 +568,81 @@ class AgentmanApp:
         request and is ``cancelled`` at the end, even if the workflow unwind
         wrote the status first. Otherwise return ``cancelled: false`` with the
         current status.
+
+        The workflow writes the run row in its first step. A cancel can arrive
+        before that. The live-run map then names the run, and the daemon writes
+        the row itself after DBOS accepts the cancel.
         """
         store = self._store()
         run = await store.get_run(run_id)
-        if run is None:
+        live = self._live.get(run_id)
+        if run is not None:
+            owner = run.workspace
+        elif live is not None:
+            owner = live.workspace
+        else:
             raise _HttpError(404, f"no run {run_id!r}")
-        if run.workspace != workspace:
+        if owner != workspace:
             raise _HttpError(409, f"run {run_id!r} belongs to a different workspace")
-        if run.status in RUN_TERMINAL:
+        if run is not None and run.status in RUN_TERMINAL:
             return {"run_id": run_id, "status": run.status, "cancelled": False}
+        current = run.status if run is not None else RUN_RUNNING
 
+        if live is not None:
+            # The turn handler reads the reason when the cancel ends its stream.
+            if live.cancel_reason is None:
+                live.cancel_reason = reason
+            # DBOS cannot cancel a workflow that does not exist yet.
+            await live.started.wait()
         await DBOS.cancel_workflow_async(run_id)
         workflow_status = await DBOS.get_workflow_status_async(run_id)
         status = workflow_status.status if workflow_status is not None else None
         if status == "CANCELLED":
-            latest = await self._finish_cancelled(run_id, reason=reason)
+            latest = await self._finish_cancelled(run_id, reason=reason, live=live)
             if latest is not None and latest.status == RUN_CANCELLED:
                 return {"run_id": run_id, "status": RUN_CANCELLED, "cancelled": True}
-            return {"run_id": run_id, "status": latest.status if latest is not None else run.status, "cancelled": False}
+            return {"run_id": run_id, "status": latest.status if latest is not None else current, "cancelled": False}
         if status in {"SUCCESS", "ERROR"}:
             latest = await store.get_run(run_id)
             return {
                 "run_id": run_id,
-                "status": latest.status if latest is not None else run.status,
+                "status": latest.status if latest is not None else current,
                 "cancelled": False,
             }
         raise _HttpError(409, f"run {run_id!r} could not be cancelled")
 
-    async def _finish_cancelled(self, run_id: str, *, reason: str) -> Run | None:
-        """Write ``cancelled`` if the run is still ``running``; return the row after the write."""
+    async def _finish_cancelled(self, run_id: str, *, reason: str, live: _LiveRun | None = None) -> Run | None:
+        """Write ``cancelled`` if the run is still ``running``; return the row after the write.
+
+        ``live`` is the live-run record. With it, the function creates a
+        ``cancelled`` row when the run has none. This happens when DBOS cancelled
+        the workflow before its first step ran.
+        """
         store = self._store()
         usage = await usage_so_far(self.step_store, run_id) if self.step_store is not None else None
-        won = await store.finish_run(
-            run_id,
-            status=RUN_CANCELLED,
-            usage=usage,
-            error=RunError(reason=reason).model_dump(mode="json"),
-        )
+        error = RunError(reason=reason).model_dump(mode="json")
+        won = await store.finish_run(run_id, status=RUN_CANCELLED, usage=usage, error=error)
+        latest = await store.get_run(run_id)
+        if latest is None and live is not None:
+            try:
+                latest = await store.create_run(
+                    run_id=run_id,
+                    thread_id=live.thread_id,
+                    workspace=live.workspace,
+                    agent=live.agent,
+                    model=live.model,
+                    prompt=live.prompt,
+                    status=RUN_CANCELLED,
+                    error=error,
+                )
+                won = True
+            except IntegrityError:
+                # The workflow wrote the row first. Finish that row instead.
+                won = await store.finish_run(run_id, status=RUN_CANCELLED, usage=usage, error=error)
+                latest = await store.get_run(run_id)
         if won:
             logger.info("cancelled run %s with reason %s", run_id, reason)
-        return await store.get_run(run_id)
+        return latest
 
     async def _cancel_after_disconnect(self, run_id: str, *, workspace: str) -> bool:
         """Cancel the workflow of a client that left. Never raise.

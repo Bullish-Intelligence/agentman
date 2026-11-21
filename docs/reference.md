@@ -30,6 +30,7 @@ one, it is the resolved current directory.
 `--max-transport-retries` sets the transport retry limit for one run. Zero
 allows one initial request and no transport retry. The option applies only to
 `inferference:` models. Omit it to keep the provider default.
+`send` also accepts `--run-id ID`. The daemon uses the id as the run id.
 
 ## Exact command behavior
 
@@ -46,7 +47,7 @@ allows one initial request and no transport retry. The option applies only to
 | `resume` | `RUN_ID [--yes]` | Fetches the run, verifies its workspace, prints status, optionally confirms, and delegates resumption to DBOS. |
 | `cancel` | `[RUN_ID] [--thread NAME] [--all-running]` | Requires exactly one selector. A run id selects one run. `--thread` selects running runs in the named thread. `--all-running` selects running runs in every workspace thread. A selector can pick several runs. The command tries every run, even after an error, and prints each error on stderr. The exit code is `2` if any run failed with an error, else `1` if any run was already final, else `0`. |
 | `config` | none | Prints resolved values and provenance, including inferference's resolved router URL when applicable. |
-| `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. |
+| `send` | `MESSAGE [--agent NAME] [--model MODEL] [--max-transport-retries N] [--run-id ID] [--json]` | Runs one turn. If no current thread exists, it creates an unnamed one. `--run-id` sets the run id. The daemon refuses an id that exists, and an older daemon without the `client-run-id` capability makes the command fail. |
 | `pipe` | `[PREAMBLE] [--agent NAME] [--model MODEL] [--max-transport-retries N] [--json] [--each]` | Reads all stdin. Without `--each`, stdin is one turn; with it, each physical line is an independent ordinary run. |
 
 For the pinned OpenAI software development kit (SDK), the omitted local-provider
@@ -251,11 +252,16 @@ The client uses HTTP over the configured Unix socket. The protocol version is
   fields, and request fields of the wrong type, with `422` and an
   `ErrorResponse` body.
 
+The daemon lists these capabilities: `cancel` and `client-run-id`.
+
 Protocol 4 sets this rule. Protocol 3 clients and daemons are incompatible with
 protocol 4. Upgrade the client and daemon together once.
 
 The cancel route answers `404` for an unknown run. It answers `409` for a run
-in another workspace, and for a run that DBOS could not cancel.
+in another workspace, and for a run that DBOS could not cancel. A cancel that
+arrives after `run_started` and before the run row exists still finds the run.
+The daemon cancels the workflow and writes the run row with status `cancelled`
+and reason `cancel_requested`.
 
 `RunInfo` carries the run status (`running`, `completed`, `failed`, or
 `cancelled`), the usage known so far, and `error`. `error` is null unless the
@@ -265,10 +271,26 @@ exception `type` and `message` when one exists.
 
 Turn history is not sent as a `messages` field. The daemon loads it by thread
 id from the journal. `TurnRequest.max_transport_retries` is optional and must
-be non-negative when present. SSE frames carry the protocol version, run id,
+be non-negative when present.
+
+`TurnRequest.run_id` is optional. It must match `^[A-Za-z0-9._-]{1,64}$`. The
+daemon uses it as the run id, which is the DBOS workflow id. A malformed id
+returns `422` and starts nothing. An id that a live stream, a run row, or a DBOS
+workflow already uses returns `409` and starts nothing. When the field is absent,
+the daemon makes a UUID. A client sends the field only when `GET /v1/health`
+lists the `client-run-id` capability. `Client.stream_turn` raises `DaemonError`
+when the daemon lacks it, and it omits the field when it is not set.
+
+The turn response carries the run id in the header `x-agentman-run-id`. SSE frames carry the protocol version, run id,
 request and event ordinals, event kind, event payload, and a final-result flag. The event
 ordinal is one sequence for the whole run. Clients must deduplicate replayed frames by
 `(run_id, event_ordinal)`. The final frame has ordinal `-1`.
+
+The first frame of every stream has kind `run_started`. It is a non-final frame
+with request and event ordinal `0`, and its event is `{"run_id": "<id>"}`. The
+daemon sends it before the workflow starts, so a client can cancel by id before
+any model event. Ordinal `0` belongs to this frame alone. The CLI and
+`Client.stream_turns` ignore it.
 
 ### SSE delivery and failure semantics
 
@@ -280,11 +302,10 @@ data: <JSON StreamEnvelope>
 
 ```
 
-The daemon keeps subscriber queues only for live connections. The current
-implementation starts the DBOS workflow before registering the request's
-subscriber, so events emitted in that short window can be dropped. It does not
-replay missed events from Postgres into a later subscriber. The journal and
-stored snapshots are authoritative.
+The daemon keeps subscriber queues only for live connections. It registers the
+request's subscriber before it starts the DBOS workflow, so the workflow cannot
+publish to a missing subscriber. It does not replay missed events from Postgres
+into a later subscriber. The journal and stored snapshots are authoritative.
 
 DBOS replay can cause an event to be observed more than once. The request and
 event ordinal makes those duplicates removable by the client. Inside a DBOS step the ordinal

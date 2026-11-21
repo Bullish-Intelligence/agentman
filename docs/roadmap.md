@@ -27,6 +27,10 @@ harness cannot write the end of the effect record after the cancel, so the
 record stays `started` and `agentman status` lists it as unresolved. The final
 turn frame arrives after the tool returns.
 
+A client can choose the run id. The daemon subscribes before it starts the
+workflow and sends a first `run_started` frame. A client can therefore cancel by
+id before any model event, and the stream loses no early event.
+
 The next cancellation work is:
 
 - complete the effect record of a tool that finishes after a cancel;
@@ -35,7 +39,6 @@ The next cancellation work is:
   the `cancel` capability;
 - allow `max_transport_retries` for `openai:` models;
 - count usage from interrupted model requests when the server exposes it;
-- subscribe before workflow startup so the first stream events are not lost;
 - change Strata only if the live probe proves that it keeps generating after
   the client closes its stream.
 

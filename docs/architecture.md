@@ -187,12 +187,26 @@ replayed step therefore yields the same ordinals, and the client drops the
 copies. DBOS step ids start at 1, so these ordinals are 1 or more. A handler call
 that emits 2**20 events or more raises an error. Outside a DBOS step, as in
 `run_turn` in tests, the subscriber registry counts events for the run, from 1,
-and forgets the counter when the last subscriber leaves. Ordinal 0 stays free
-for a daemon-stamped frame. The final frame keeps request and event ordinal `-1`.
+and forgets the counter when the last subscriber leaves. Ordinal 0 belongs to
+the `run_started` frame. The final frame keeps request and event ordinal `-1`.
+
+The daemon chooses the run id before it starts the workflow. It takes the id from
+`TurnRequest.run_id`, or it makes a UUID. It subscribes to the id, then sends the
+response start and a first `run_started` frame, then starts the workflow with
+`SetWorkflowID`. The subscriber therefore exists before the workflow can publish,
+and the client knows the run id before any model event. The daemon answers `409`
+when a live stream or an existing run or workflow already uses the id, because
+DBOS itself returns the existing workflow for a duplicate id.
+
+The daemon also keeps a map of live runs, from the reservation of the id to the
+end of the stream. The workflow writes the run row in its first step, so a
+cancel can arrive before the row exists. The cancel then finds the run in the
+map, waits for the workflow start, and cancels the DBOS workflow. If the row
+is still absent, the daemon writes it with status `cancelled` and reason
+`cancel_requested`.
 
 Streaming is therefore a presentation path with replay tolerance, not the
-source of truth for history. The current request path starts the workflow before
-registering the subscriber, so an initial event can be missed. On success the
+source of truth for history. On success the
 daemon emits a final `turn_result` frame after draining live events. On
 workflow failure it emits a final `turn_error` frame; the CLI reports a finding
 and operators inspect the durable run record. When a client disconnects, its

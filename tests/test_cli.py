@@ -250,6 +250,7 @@ def test_cli_missing_daemon_is_configuration_failure(monkeypatch: pytest.MonkeyP
 
 def test_send_passes_transport_retry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[int | None] = []
+    run_ids: list[str | None] = []
 
     async def fake_one_turn(
         message: str,
@@ -258,14 +259,22 @@ def test_send_passes_transport_retry_limit(monkeypatch: pytest.MonkeyPatch) -> N
         model: object,
         json_output: object,
         max_transport_retries: int | None,
+        run_id: str | None = None,
     ) -> None:
         calls.append(max_transport_retries)
+        run_ids.append(run_id)
 
     monkeypatch.setattr(cli, "_one_turn", fake_one_turn)
     result = CliRunner().invoke(app, ["send", "hello", "--max-transport-retries", "0"])
 
     assert result.exit_code == 0, result.output
     assert calls == [0]
+    assert run_ids == [None]
+
+    result = CliRunner().invoke(app, ["send", "hello", "--run-id", "folio-1"])
+
+    assert result.exit_code == 0, result.output
+    assert run_ids == [None, "folio-1"]
 
 
 def test_send_rejects_negative_transport_retry_limit() -> None:

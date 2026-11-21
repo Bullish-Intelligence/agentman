@@ -68,6 +68,9 @@ class TurnOutcome:
 class Client:
     """An async client over the daemon's Unix socket."""
 
+    # The daemon capabilities, read once from the health endpoint.
+    _capability_cache: list[str] | None = None
+
     def __init__(self, socket_path: str | Path, *, timeout: float = 300.0) -> None:
         self.socket_path = str(socket_path)
         transport = httpx.AsyncHTTPTransport(uds=self.socket_path)
@@ -95,6 +98,12 @@ class Client:
         return response.status_code == httpx.codes.OK
 
     async def capabilities(self) -> list[str]:
+        """Return the capabilities the daemon lists. The client reads them once and keeps them."""
+        if self._capability_cache is None:
+            self._capability_cache = await self._read_capabilities()
+        return list(self._capability_cache)
+
+    async def _read_capabilities(self) -> list[str]:
         payload = await self._get("/v1/health")
         if not isinstance(payload, dict):
             return []
@@ -148,6 +157,12 @@ class Client:
     # -- the turn --------------------------------------------------------------
 
     async def stream_turn(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
+        """Stream the frames of one turn.
+
+        The first frame has kind ``run_started`` and carries the run id. Set
+        ``request.run_id`` to choose the id. The daemon must list the
+        ``client-run-id`` capability, or this method raises ``DaemonError``.
+        """
         async with aclosing(self._raw_stream(request)) as raw, aclosing(_deduplicate(raw)) as unique:
             async for envelope in unique:
                 yield envelope
@@ -191,7 +206,15 @@ class Client:
         return list(await asyncio.gather(*(one(index, request) for index, request in enumerate(requests))))
 
     async def _raw_stream(self, request: TurnRequest) -> AsyncGenerator[StreamEnvelope]:
+        if request.run_id is not None and "client-run-id" not in await self.capabilities():
+            raise DaemonError(
+                "the daemon does not support a client run id; upgrade the daemon or send no run_id",
+                status_code=409,
+            )
         data = request.model_dump(mode="json")
+        if request.run_id is None:
+            # An older daemon rejects an unknown request field, even a null one.
+            data.pop("run_id")
         try:
             async with self._client.stream("POST", "/v1/turns", json=data, timeout=self._stream_timeout) as response:
                 if response.status_code != httpx.codes.OK:
@@ -254,7 +277,8 @@ async def _deduplicate(
     The event ordinal is one sequence for the whole run, so it alone names an
     event. DBOS may re-execute a step after a crash, so events can repeat. A
     replayed step yields the same ordinals, and this function drops the copies.
-    The final frame has ordinal ``-1``. Only one final frame exists per turn.
+    The ``run_started`` frame has ordinal ``0``. The final frame has ordinal
+    ``-1``. Only one final frame exists per turn.
     The record is authoritative and complete either way.
     """
     seen: set[tuple[str, int]] = set()

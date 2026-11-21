@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 
 import httpx
+import pytest
 
-from agentman.client import Client, TurnStreamError
+from agentman.client import Client, DaemonError, TurnStreamError
 from agentman.protocol import RunInfo, StatusView, StreamEnvelope, TurnRequest, TurnResponse
 
 
@@ -247,3 +249,76 @@ def test_client_ignores_unknown_fields_in_a_status_view_payload() -> None:
     assert view.latest_run is not None
     assert view.latest_run.id == "run-1"
     assert view.unresolved_effects[0].tool_name == "write"
+
+
+def _frame(kind: str, run_id: str, ordinal: int, *, final: bool = False, event: dict[str, object] | None = None) -> str:
+    envelope = StreamEnvelope(
+        run_id=run_id, request_ordinal=ordinal, event_ordinal=ordinal, kind=kind, event=event or {}, final=final
+    )
+    return f"event: {kind}\ndata: {envelope.model_dump_json()}\n\n"
+
+
+def _mock_client(handler: object) -> Client:
+    client = Client("/tmp/agentman-test.sock")
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
+        base_url="http://agentman",
+    )
+    return client
+
+
+def test_stream_turn_refuses_a_run_id_when_the_daemon_lacks_the_capability() -> None:
+    posted: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            return httpx.Response(200, json={"status": "ok", "capabilities": ["cancel"]})
+        posted.append(request)
+        return httpx.Response(200, text="")
+
+    async def scenario() -> None:
+        async with _mock_client(handler) as client:
+            request = TurnRequest(workspace="/repo", thread_id="t", model="mock", prompt="hi", run_id="folio-1")
+            async with aclosing(client.stream_turn(request)) as stream:
+                async for _ in stream:
+                    pass
+
+    with pytest.raises(DaemonError, match="client run id"):
+        asyncio.run(scenario())
+    assert posted == []
+
+
+def test_stream_turn_sends_the_run_id_only_when_set_and_passes_run_started_through() -> None:
+    bodies: list[dict[str, object]] = []
+    health_calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            health_calls.append(1)
+            return httpx.Response(200, json={"status": "ok", "capabilities": ["cancel", "client-run-id"]})
+        body = json.loads(request.content)
+        bodies.append(body)
+        run_id = body.get("run_id", "generated")
+        text = _frame("run_started", run_id, 0, event={"run_id": run_id}) + _frame(
+            "turn_result", run_id, -1, final=True, event={"run_id": run_id, "thread_id": "t"}
+        )
+        return httpx.Response(200, text=text)
+
+    async def collect(client: Client, request: TurnRequest) -> list[str]:
+        async with aclosing(client.stream_turn(request)) as stream:
+            return [envelope.kind async for envelope in stream]
+
+    async def scenario() -> tuple[list[str], list[str]]:
+        async with _mock_client(handler) as client:
+            chosen = await collect(
+                client, TurnRequest(workspace="/repo", thread_id="t", model="mock", prompt="hi", run_id="folio-1")
+            )
+            default = await collect(client, TurnRequest(workspace="/repo", thread_id="t", model="mock", prompt="hi"))
+            return chosen, default
+
+    chosen, default = asyncio.run(scenario())
+
+    assert chosen == default == ["run_started", "turn_result"]
+    assert bodies[0]["run_id"] == "folio-1"
+    assert "run_id" not in bodies[1], "an older daemon rejects an unknown request field"
+    assert len(health_calls) == 1, "the client reads the capabilities once"
