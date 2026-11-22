@@ -100,14 +100,39 @@ class TurnRequest(RequestModel):
         return validate_metadata(value) if value is not None else None
 
 
+class ChatRequestRecord(ResponseModel):
+    """Non-secret facts of one outgoing chat-completion request.
+
+    ``output_caps`` holds each output-length field that the body carries, with
+    its value as sent (``max_tokens``, ``max_completion_tokens``, and similar).
+    ``body_bytes`` and ``body_sha256`` describe the exact body on the wire.
+    ``host`` and ``path`` come from the URL without credentials. ``at`` is a
+    UTC ISO 8601 time. The record never holds the prompt.
+    """
+
+    model: str | None = None
+    output_caps: dict[str, Any] = Field(default_factory=dict)
+    body_bytes: int = 0
+    body_sha256: str = ""
+    host: str = ""
+    path: str = ""
+    at: str = ""
+
+
 class RunMetadata(ResponseModel):
-    """Non-secret retry facts for one run."""
+    """Non-secret retry and request facts for one run.
+
+    ``chat_requests`` has one record for each physical chat-completion request,
+    in send order. It is ``None`` when the daemon did not record requests: an
+    older daemon, or a model that the daemon does not track.
+    """
 
     requested_max_transport_retries: int | None = None
     effective_max_transport_retries: int | None = None
     provider_fallback: bool = False
     logical_turn_count: int = 1
     physical_model_request_count: int | None = None
+    chat_requests: list[ChatRequestRecord] | None = None
 
 
 class RunError(ResponseModel):
@@ -265,6 +290,7 @@ class ErrorResponse(ResponseModel):
 
 __all__ = [
     "CAPABILITIES",
+    "ChatRequestRecord",
     "MAX_METADATA_BYTES",
     "PROTOCOL_VERSION",
     "RUN_ID_PATTERN",

@@ -42,6 +42,10 @@ def _turn(thread_id: str, *, prompt: str = "summarise this") -> Turn:
     )
 
 
+def _without_requests(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metadata.items() if key != "chat_requests"}
+
+
 def _chat_requests(mock: MockOpenAI) -> list[dict[str, Any]]:
     return [
         request
@@ -179,13 +183,14 @@ async def test_transport_zero_makes_one_request_and_does_not_fall_back() -> None
     record = await product.get_run("run-zero")
     assert record is not None
     assert record.status == "failed"
-    assert record.run_metadata == {
+    assert _without_requests(record.run_metadata) == {
         "requested_max_transport_retries": 0,
         "effective_max_transport_retries": 0,
         "provider_fallback": False,
         "logical_turn_count": 1,
         "physical_model_request_count": 1,
     }
+    assert len(record.run_metadata["chat_requests"]) == 1
     chat_requests = _chat_requests(mock)
     assert len(chat_requests) == 1
     assert {request["model"] for request in chat_requests} == {"gemma"}
@@ -225,14 +230,58 @@ async def test_positive_transport_retry_is_separate_from_agent_retries_and_keeps
     chat_requests = _chat_requests(mock)
     assert len(chat_requests) == 2
     assert all(request["response_format"]["type"] == "json_schema" for request in chat_requests)
-    assert result.run_metadata == {
+    assert _without_requests(result.run_metadata) == {
         "requested_max_transport_retries": 1,
         "effective_max_transport_retries": 1,
         "provider_fallback": False,
         "logical_turn_count": 1,
         "physical_model_request_count": 2,
     }
+    assert len(result.run_metadata["chat_requests"]) == 2
     assert "api_key" not in result.run_metadata
+
+
+async def test_run_metadata_records_the_chat_requests_without_the_prompt() -> None:
+    mock = MockOpenAI(content="done")
+    step_store = InMemoryStepStore()
+    product = FakeProductStore()
+    thread = await product.create_thread(workspace="/repo", name="record")
+    turn = replace(
+        _turn(thread.id, prompt="secret prompt text"),
+        agent_spec={"instructions": "be brief", "retries": 0},
+        output_schema=None,
+        output_type="str",
+    )
+
+    reset_agent_cache()
+    with serve_openai_mock(mock) as port:
+        result = await run_turn(
+            replace(turn, router_url=f"http://127.0.0.1:{port}"),
+            step_store=step_store,
+            product_store=product,
+            run_id="run-record",
+        )
+    reset_agent_cache()
+
+    records = result.run_metadata["chat_requests"]
+    assert len(records) == 1
+    record = records[0]
+    assert record["model"] == "gemma"
+    assert record["host"] == f"127.0.0.1:{port}"
+    assert record["path"].endswith("/chat/completions")
+    assert record["body_bytes"] > 0
+    assert len(record["body_sha256"]) == 64
+    assert record["at"].endswith("+00:00")
+    assert "secret prompt text" not in json.dumps(result.run_metadata)
+    stored = await product.get_run("run-record")
+    assert stored is not None
+    assert stored.run_metadata["chat_requests"] == records
+
+
+async def test_run_metadata_without_a_tracked_model_has_no_chat_requests() -> None:
+    from agentman.runtime import _run_metadata
+
+    assert _run_metadata(_turn("thread"), counter=None)["chat_requests"] is None
 
 
 async def test_agent_output_retry_budget_does_not_follow_transport_retry_limit() -> None:

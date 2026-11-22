@@ -518,7 +518,7 @@ async def run_turn(
         if model is not None
         else agent_for_turn(turn, step_store=step_store, event_stream_handler=event_stream_handler)
     )
-    initial_metadata = _run_metadata(turn, physical_model_request_count=None)
+    initial_metadata = _run_metadata(turn, counter=None)
     await _create_run_step(
         product_store,
         run_id=run_id,
@@ -546,7 +546,7 @@ async def run_turn(
         output = _jsonable(result.output)
         metadata = _run_metadata(
             turn,
-            physical_model_request_count=request_counter.count if request_counter is not None else None,
+            counter=request_counter,
         )
         await _update_run_step(
             product_store,
@@ -576,7 +576,7 @@ async def run_turn(
             run_id,
             metadata=_run_metadata(
                 turn,
-                physical_model_request_count=request_counter.count if request_counter is not None else None,
+                counter=request_counter,
             ),
             usage=await usage_so_far(step_store, run_id),
             error=workflow_cancelled_error(error),
@@ -585,7 +585,7 @@ async def run_turn(
     except Exception as error:
         metadata = _run_metadata(
             turn,
-            physical_model_request_count=request_counter.count if request_counter is not None else None,
+            counter=request_counter,
         )
         await _record_failure(
             product_store,
@@ -606,7 +606,7 @@ async def run_turn(
             run_id,
             metadata=_run_metadata(
                 turn,
-                physical_model_request_count=request_counter.count if request_counter is not None else None,
+                counter=request_counter,
             ),
             usage=await usage_so_far(step_store, run_id),
             error=workflow_cancelled_error(cancelled),
@@ -614,7 +614,7 @@ async def run_turn(
         raise DBOSWorkflowCancelledError(str(cancelled)) from group
 
 
-def _run_metadata(turn: Turn, *, physical_model_request_count: int | None) -> dict[str, Any]:
+def _run_metadata(turn: Turn, *, counter: TransportRequestCounter | None) -> dict[str, Any]:
     effective_retries = None
     if turn.model.startswith(MODEL_PREFIX):
         effective_retries = (
@@ -625,7 +625,8 @@ def _run_metadata(turn: Turn, *, physical_model_request_count: int | None) -> di
         effective_max_transport_retries=effective_retries,
         provider_fallback=False,
         logical_turn_count=1,
-        physical_model_request_count=physical_model_request_count,
+        physical_model_request_count=counter.count if counter is not None else None,
+        chat_requests=list(counter.requests) if counter is not None else None,
     ).model_dump(mode="json")
 
 

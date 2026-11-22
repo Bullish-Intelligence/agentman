@@ -4,6 +4,16 @@ agentman ships two distributions at one version: `agentman` (the daemon and the
 CLI) and `agentman-client` (the client, the protocol models, and the spec
 loader).
 
+## Unreleased
+
+### Runs
+
+- Record the facts of each outgoing chat-completion request in
+  `RunMetadata.chat_requests`: the model, the output-length fields as sent, the
+  body size, the body SHA-256, the URL host and path, and the time. A record
+  never holds the prompt or a credential. The field is optional, so older
+  clients and older daemons still work. The protocol version stays `4`.
+
 ## 0.1.0 — 2026-11-21
 
 This release breaks the socket protocol. Protocol 4 does not work with

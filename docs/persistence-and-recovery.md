@@ -267,6 +267,15 @@ each chat-completion HTTP attempt, including SDK retries. The count is null for
 provider paths that do not expose this transport counter. Existing runs have
 empty metadata and do not claim a retry count.
 
+On the same path, `run_metadata.chat_requests` lists one record for each
+attempt, in send order. A record holds the request `model`, `output_caps`, the
+body size (`body_bytes`), the body SHA-256 (`body_sha256`), the URL `host` and
+`path`, and the UTC time (`at`). `output_caps` holds each output-length field
+that the body carries (`max_tokens`, `max_completion_tokens`,
+`max_output_tokens`, `max_new_tokens`, `n_predict`) with its value as sent. A
+record never holds the prompt, a header, or a URL credential. The list is null
+when the run did not record requests.
+
 ## `resume`
 
 The recovery path has a deliberately small policy boundary:

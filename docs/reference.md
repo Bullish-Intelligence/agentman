@@ -65,7 +65,11 @@ An explicit retry limit with another provider returns an error before the
 daemon starts a run. Run records expose the requested and effective limits,
 the fallback state, the logical turn count, and the physical request count.
 The physical count is null when the selected provider does not expose an
-instrumented transport path.
+instrumented transport path. `RunMetadata.chat_requests` is a list of
+`ChatRequestRecord` values, one for each physical chat-completion request. It
+is null in the same case, and for a daemon that predates the field. This is an
+additive response field: the protocol version stays `4`, a client ignores
+unknown fields, and a client reads a missing field as null.
 
 `pipe` accepts the optional-value forms `-j`, `-jN`, `--jobs`,
 `--jobs=N`, and `--jobs N`. The option may appear once and requires

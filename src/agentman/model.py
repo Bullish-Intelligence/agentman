@@ -14,11 +14,15 @@ callable.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx2
 from inferference import (
@@ -33,6 +37,7 @@ from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from agentman.config import DEFAULT_ROUTER_KEY_ENV
+from agentman.protocol import ChatRequestRecord
 
 PREFIX = "inferference:"
 """The model-string prefix that selects the local router."""
@@ -41,11 +46,20 @@ DEFAULT_MAX_TRANSPORT_RETRIES = 2
 """The locked OpenAI SDK default, retained when a caller omits the setting."""
 
 
+OUTPUT_CAP_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens", "n_predict")
+"""Request body fields that limit the output length."""
+
+
 @dataclass
 class TransportRequestCounter:
-    """Count physical chat-completion HTTP attempts in one run context."""
+    """Count physical chat-completion HTTP attempts in one run context.
+
+    ``requests`` holds one record of facts for each attempt. A record never
+    holds the prompt, a header, or a credential.
+    """
 
     count: int = 0
+    requests: list[ChatRequestRecord] = field(default_factory=list)
 
 
 _active_transport_counter: ContextVar[TransportRequestCounter | None] = ContextVar(
@@ -63,11 +77,47 @@ def bind_transport_request_counter(counter: TransportRequestCounter | None) -> I
         _active_transport_counter.reset(token)
 
 
+def chat_request_record(request: httpx2.Request) -> ChatRequestRecord:
+    """Return the non-secret facts of one outgoing chat-completion request.
+
+    The record holds the model, the output-length fields as sent, the body
+    size, the body SHA-256, the host and path, and the time. It leaves out the
+    prompt, the headers, and any credential in the URL.
+    """
+    try:
+        body = request.content
+    except httpx2.RequestNotRead:
+        body = b""
+    model: str | None = None
+    output_caps: dict[str, Any] = {}
+    try:
+        parsed = json.loads(body) if body else None
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        value = parsed.get("model")
+        model = value if isinstance(value, str) else None
+        output_caps = {name: parsed[name] for name in OUTPUT_CAP_FIELDS if name in parsed}
+    host = request.url.host
+    if request.url.port is not None:
+        host = f"{host}:{request.url.port}"
+    return ChatRequestRecord(
+        model=model,
+        output_caps=output_caps,
+        body_bytes=len(body),
+        body_sha256=hashlib.sha256(body).hexdigest(),
+        host=host,
+        path=request.url.path,
+        at=datetime.now(UTC).isoformat(timespec="milliseconds"),
+    )
+
+
 async def _count_chat_completion(request: httpx2.Request) -> None:
     if request.method == "POST" and request.url.path.endswith("/chat/completions"):
         counter = _active_transport_counter.get()
         if counter is not None:
             counter.count += 1
+            counter.requests.append(chat_request_record(request))
 
 
 def router_api_key(env_name: str | None = None, environ: Mapping[str, str] | None = None) -> str | None:
