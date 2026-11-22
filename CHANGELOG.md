@@ -4,7 +4,10 @@ agentman ships two distributions at one version: `agentman` (the daemon and the
 CLI) and `agentman-client` (the client, the protocol models, and the spec
 loader).
 
-## Unreleased
+## 0.1.0 — 2026-11-21
+
+This release breaks the socket protocol. Protocol 4 does not work with
+protocol-3 clients. Upgrade `agentman` and `agentman-client` together.
 
 ### Packaging
 
@@ -24,7 +27,7 @@ loader).
 - Add a gated packaging test (`AGENTMAN_RUN_PACKAGING=1`) and a test that both
   distributions state one version.
 
-### Already landed on main
+### Protocol and runs
 
 - Move the socket protocol to version 4, with a compatibility rule.
 - Make the event ordinal one sequence for each run.

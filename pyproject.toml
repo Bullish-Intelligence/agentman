@@ -1,6 +1,6 @@
 [project]
 name = "agentman"
-version = "0.0.4"
+version = "0.1.0"
 description = "A CLI for talking to typed agents. Every model call and tool call is recorded, always."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -12,7 +12,7 @@ authors = [
 dependencies = [
   # The client, protocol, config, discovery, and spec loader live in the
   # `agentman-client` workspace member. Keep its version equal to this one.
-  "agentman-client==0.0.4",
+  "agentman-client==0.1.0",
   "pydantic>=2",
   "pydantic-ai-slim[openai]>=2.41,<3",
   # Capped on purpose. `WorkflowRunIdStepPersistence` overrides `for_run` and

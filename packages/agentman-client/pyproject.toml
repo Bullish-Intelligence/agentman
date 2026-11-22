@@ -2,7 +2,7 @@
 name = "agentman-client"
 # Keep this version equal to the root `agentman` version and to
 # `agentman.__version__`. A test checks it. See docs/development.md.
-version = "0.0.4"
+version = "0.1.0"
 description = "The client, protocol models, and spec loader for the agentman daemon. It has no server dependencies."
 readme = "README.md"
 requires-python = ">=3.13"
