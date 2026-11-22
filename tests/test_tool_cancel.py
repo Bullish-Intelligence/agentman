@@ -238,9 +238,10 @@ async def test_a_group_that_is_gone_gets_no_signal(monkeypatch: pytest.MonkeyPat
 
 
 async def test_a_command_that_ignores_sigterm_gets_sigkill_after_the_grace_time(tmp_path: Path) -> None:
-    rig = await _start(tmp_path, "trap '' TERM; sleep 30; echo late >> note.md")
+    rig = await _start(tmp_path, "trap '' TERM; touch trap-ready; sleep 30; echo late >> note.md")
     pid = (await rig.wait_for("shell.command_started"))["pid"]
-    await asyncio.sleep(0.2)
+    # The shell makes the marker after it installs the trap. Until then SIGTERM kills it at once.
+    await _wait_until((rig.workspace / "trap-ready").exists)
 
     began = time.monotonic()
     survivors = await rig.app._stop_tool_processes(RUN_ID)
