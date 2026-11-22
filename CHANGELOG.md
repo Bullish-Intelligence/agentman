@@ -4,7 +4,7 @@ agentman ships two distributions at one version: `agentman` (the daemon and the
 CLI) and `agentman-client` (the client, the protocol models, and the spec
 loader).
 
-## Unreleased
+## 0.1.1 — 2026-11-22
 
 ### Runs
 

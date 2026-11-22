@@ -11,4 +11,4 @@ model run it, and where the record lives. See ``docs/architecture.md``.
 # one folder or in two editable source trees.
 __path__[:] = __import__("pkgutil").extend_path(__path__, __name__)
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
